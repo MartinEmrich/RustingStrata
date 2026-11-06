@@ -104,6 +104,11 @@ impl<'a> Model<'a> {
     fn t(&self, il: usize, suffix: &str) -> Tensor<'a> {
         self.w.layer(il, suffix).unwrap_or_else(|e| panic!("{e:#}"))
     }
+
+    /// Expert `e` of a stacked matrix (fused gate/up files included).
+    fn we(&self, il: usize, suffix: &str, e: usize, n: usize) -> Tensor<'a> {
+        self.w.expert(il, suffix, e, n).unwrap_or_else(|e| panic!("{e:#}"))
+    }
     fn f(&self, il: usize, suffix: &str) -> Vec<f32> { self.t(il, suffix).to_f32() }
 
     pub fn embed(&self, token: u32) -> Vec<f32> {
@@ -451,11 +456,10 @@ impl<'a> Model<'a> {
 
     /// Router, top-k and the weighted sum of routed experts (no shared expert).
     pub fn routed_experts(&self, il: usize, h: &[f32]) -> Vec<f32> {
-        let (gate, up, down) = (self.t(il, "ffn_gate_exps.weight"), self.t(il, "ffn_up_exps.weight"), self.t(il, "ffn_down_exps.weight"));
         let n = self.cfg.n_expert;
         let mut y = vec![0f32; self.cfg.n_embd];
         for (e, w) in self.route(il, h) {
-            let o = Self::ffn(&gate.expert(e, n), &up.expert(e, n), &down.expert(e, n), h);
+            let o = Self::ffn(&self.we(il, "ffn_gate_exps.weight", e, n), &self.we(il, "ffn_up_exps.weight", e, n), &self.we(il, "ffn_down_exps.weight", e, n), h);
             for (a, b) in y.iter_mut().zip(o) { *a += w * b; }
         }
         y

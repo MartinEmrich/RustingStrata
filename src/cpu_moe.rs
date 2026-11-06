@@ -754,19 +754,19 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     let c = &m.cfg;
     let mut y = vec![0f32; c.n_embd];
     if sel.is_empty() { return y; }
-    let t = |s: &str| m.w.layer(il, s).unwrap_or_else(|e| panic!("{e:#}"));
-    let (gate, up, down) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
-    let (n, ff, k) = (c.n_expert, c.n_ff_exp, sel.len());
+    let t = |s: &str, e: usize| m.w.expert(il, s, e, c.n_expert).unwrap_or_else(|e| panic!("{e:#}"));
+    let (ff, k) = (c.n_ff_exp, sel.len());
+    let (gt, ut) = (t("ffn_gate_exps.weight", 0), t("ffn_up_exps.weight", 0));
     // Gate and up of every expert in one parallel pass (gate and up share a type in all supported files).
-    let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [gate.expert(e, n), up.expert(e, n)]).collect();
+    let gu: Vec<Tensor> = sel.iter().flat_map(|&(e, _)| [t("ffn_gate_exps.weight", e), t("ffn_up_exps.weight", e)]).collect();
     let mut a = vec![0f32; 2 * k * ff];
-    if gate.ty == up.ty {
+    if gt.ty == ut.ty {
         batch_rows(&gu, &[h], &mut a);
     } else {
         for (i, t) in gu.iter().enumerate() { matvec(t, h, &mut a[i * ff..(i + 1) * ff]); }
     }
     let acts: Vec<Vec<f32>> = a.chunks_exact(2 * ff).map(|g| (0..ff).map(|i| ops::silu(g[i]) * g[ff + i]).collect()).collect();
-    let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| down.expert(e, n)).collect();
+    let ds: Vec<Tensor> = sel.iter().map(|&(e, _)| t("ffn_down_exps.weight", e)).collect();
     let mut o = vec![0f32; k * c.n_embd];
     batch_rows(&ds, &acts.iter().map(|v| v.as_slice()).collect::<Vec<_>>(), &mut o);
     for (oj, &(_, w)) in o.chunks_exact(c.n_embd).zip(sel) {

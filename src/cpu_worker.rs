@@ -102,13 +102,28 @@ impl CpuWorker {
                     // Bulk streaming reads, as in `routing`: plain loads of the Vulkan BAR mailbox are each an
                     // uncached read (~130 us for one activation).
                     let mut v = vec![0u32; (3 * kt).next_multiple_of(4)];
-                    unsafe { read_wc(at(IDS), &mut v) };
+                    // Without coherent memory the GPU's release store can reach host memory before the routing data
+                    // it orders (GCN evicts the flag's cache line first): re-read until the ids are plausible, then
+                    // everything the request carries is there. A combine that outwaits this gives up and the host
+                    // resumes the forward (GpuModel::finish), so a slow landing costs a resume, not correctness.
+                    for tries in 0.. {
+                        unsafe { read_wc(at(IDS), &mut v) };
+                        let ok = (0..kt).all(|j| (v[j] as usize) < m.cfg.n_expert
+                            && (0.0..=100.0).contains(&f32::from_bits(v[kt + j])));
+                        if ok { break; }
+                        if tries == 2000 {
+                            let d: Vec<Vec<u32>> = (0..3).map(|r| v[r * kt..(r + 1) * kt].to_vec()).collect();
+                            panic!("mailbox layer {il} seq {seq} nt {nt}: ids out of range after 200 ms of re-reads\n\
+                                    {d:?}");
+                        }
+                        std::thread::sleep(Duration::from_micros(100));
+                    }
                     let missed: Vec<usize> = (0..kt).filter(|&j| (v[2 * kt + j] as i32) < 0).map(|j| v[j] as usize).collect();
                     if !missed.is_empty() {
                         // Gate and up first: they are read first.
                         pre.send(["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter()
-                            .filter_map(|s| m.w.layer(il, s).ok())
-                            .flat_map(|t| missed.iter().map(move |&e| { let d = t.expert(e, m.cfg.n_expert).data; (d.as_ptr() as usize, d.len()) }).collect::<Vec<_>>())
+                            .flat_map(|s| missed.iter().filter_map(move |&e| Some(m.w.expert(il, s, e, m.cfg.n_expert).ok()?.data))
+                                .map(|d| (d.as_ptr() as usize, d.len())).collect::<Vec<_>>())
                             .collect());
                     }
                     for t in 0..nt {

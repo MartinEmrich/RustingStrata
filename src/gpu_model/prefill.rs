@@ -31,10 +31,11 @@ impl Scratch {
     pub fn new(m: &Model, gpu: &dyn Backend, chunk: usize) -> anyhow::Result<Scratch> {
         let c = &m.cfg;
         let mut stage_bytes = 0;
-        for il in 0..c.n_layer {
+        // The MTP head is staged like a layer (prefill_chunk chains it) and may quantize its experts differently.
+        for il in 0..c.n_layer + (c.n_nextn > 0) as usize {
             if !c.is_moe() { break; }
             let mut b = 0;
-            for name in MATS { b = (b + m.w.layer(il, name)?.expert(0, c.n_expert).data.len()).next_multiple_of(16); }  // as ExpertCache lays out a slot
+            for name in MATS { b = (b + m.w.expert(il, name, 0, c.n_expert)?.data.len()).next_multiple_of(16); }  // as ExpertCache lays out a slot
             stage_bytes = stage_bytes.max(b);
         }
         let (ne, k) = (c.n_embd, c.n_expert_used.max(1));
@@ -369,9 +370,18 @@ impl GpuModel<'_> {
                         (t_sync, t_sort, staged, layers) = (t_sync + (s1 - s0), t_sort + (s2 - s1), staged + missed.len() * lx.mats.iter().map(|m| m.bytes).sum::<usize>(), layers + 1);
                     }
                     if let Some(pre) = &pre {
-                        let w: Vec<_> = MATS.iter().map(|name| self.m.w.layer(il, name)).collect::<anyhow::Result<_>>()?;
-                        pre.send(missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
-                            .map(move |run| (w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)))).collect());
+                        let mut rs = Vec::new();
+                        for grp in missed.chunks(STAGE) {
+                            for (name, mat) in MATS.iter().zip(&lx.mats) {
+                                if mat.fused {  // gate/up halves: not contiguous across experts
+                                    for &e in grp { let d = self.m.w.expert(il, name, e, c.n_expert)?.data; rs.push((d.as_ptr() as usize, d.len())); }
+                                } else {
+                                    let w = self.m.w.layer(il, name)?;
+                                    for run in grp.chunk_by(|a, b| *b == a + 1) { rs.push((w.data.as_ptr() as usize + run[0] * mat.bytes, run.len() * mat.bytes)); }
+                                }
+                            }
+                        }
+                        pre.send(rs);
                     }
                     // Staged groups of at most STAGE missed experts, group j in staging third j % 3. Staging holds
                     // each matrix in its own section (all gates, then ups, then downs), so experts with consecutive
@@ -437,6 +447,13 @@ impl GpuModel<'_> {
                     let copy = |j: usize| -> anyhow::Result<()> {
                         let grp = &staged[j];
                         for (name, mat) in MATS.iter().zip(&lx.mats) {
+                            if mat.fused {  // gate/up halves: not contiguous across experts, one copy each
+                                for (i, &(e, _)) in grp.iter().enumerate() {
+                                    let d = self.m.w.expert(il, name, e, c.n_expert)?.data;
+                                    g.htod(d, &pf.staging, half(j) + STAGE * mat.off + i * mat.bytes)?;
+                                }
+                                continue;
+                            }
                             let w = self.m.w.layer(il, name)?;
                             let mut i = 0;
                             for run in grp.chunk_by(|a, b| b.0 == a.0 + 1) {

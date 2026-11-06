@@ -99,6 +99,31 @@ impl<'a> Weights<'a> {
 
     pub fn layer(&self, il: usize, suffix: &str) -> anyhow::Result<Tensor<'a>> { self.get(&format!("blk.{il}.{suffix}")) }
 
+    /// Whether layer `il` fuses the stacked gate and up experts in `ffn_gate_up_exps.weight` (gpt-oss and some
+    /// quantizers do): the per-expert block holds the gate rows, then the up rows.
+    pub fn gate_up_fused(&self, il: usize) -> bool {
+        self.g.tensors.contains_key(&format!("blk.{il}.ffn_gate_up_exps.weight"))
+            && !self.g.tensors.contains_key(&format!("blk.{il}.ffn_gate_exps.weight"))
+    }
+
+    /// Expert `e` of the stacked matrix `suffix` of layer `il`: its rows in the stacked tensor, or — for gate and
+    /// up in files that fuse them — the matching half of the fused per-expert block.
+    pub fn expert(&self, il: usize, suffix: &str, e: usize, n_expert: usize) -> anyhow::Result<Tensor<'a>> {
+        let t = match self.layer(il, suffix) {
+            Ok(t) => return Ok(t.expert(e, n_expert)),
+            Err(missing) => match suffix {
+                "ffn_gate_exps.weight" | "ffn_up_exps.weight" => self.layer(il, "ffn_gate_up_exps.weight").map_err(|_| missing)?,
+                _ => return Err(missing),
+            },
+        };
+        let rows = t.rows / (2 * n_expert);
+        let rb = t.ty.row_bytes(t.cols as u64);
+        anyhow::ensure!(t.rows % (2 * n_expert) == 0 && t.data.len() == 2 * n_expert * rows * rb,
+            "blk.{il}.ffn_gate_up_exps: {} rows, {} bytes for {n_expert} fused experts", t.rows, t.data.len());
+        let at = (2 * e + suffix.starts_with("ffn_up") as usize) * rows * rb;
+        Ok(Tensor { ty: t.ty, cols: t.cols, rows, data: &t.data[at..at + rows * rb] })
+    }
+
     /// Refuse files containing quant types this engine does not implement, except in the MTP (nextn) layers, blocks
     /// `n_layer` on: false if one of those has such a type, so that the model loads without MTP.
     pub fn validate(&self, n_layer: usize) -> anyhow::Result<bool> {

@@ -152,6 +152,66 @@ fn rejects_bad_ssm_dims() {
     assert!(Weights::new(&bad).is_err());
 }
 
+/// Minimal qwen35moe file: u32 metadata (plus the rms epsilon and ssm sizes), `token_embd` and the given F32 tensors.
+fn qwen35moe_syn(tag: &str, tensors: &[(&str, [u64; 2], Vec<f32>)]) -> Gguf {
+    let kv = [("block_count", 1), ("embedding_length", 2), ("attention.head_count", 1), ("attention.head_count_kv", 1),
+        ("ssm.inner_size", 2), ("ssm.state_size", 1), ("ssm.group_count", 1), ("ssm.time_step_rank", 1), ("ssm.conv_kernel", 1)];
+    let mut b = Vec::new();
+    b.extend(b"GGUF");
+    b.extend(3u32.to_le_bytes());
+    b.extend(((tensors.len() + 1) as u64).to_le_bytes());
+    b.extend((kv.len() as u64 + 2).to_le_bytes());
+    w_str(&mut b, "general.architecture");
+    b.extend(8u32.to_le_bytes());
+    w_str(&mut b, "qwen35moe");
+    w_str(&mut b, "qwen35moe.attention.layer_norm_rms_epsilon");
+    b.extend(6u32.to_le_bytes());
+    b.extend(1e-6f32.to_le_bytes());
+    for (k, v) in kv {
+        w_str(&mut b, &format!("qwen35moe.{k}"));
+        b.extend(4u32.to_le_bytes());
+        b.extend((v as u32).to_le_bytes());
+    }
+    let all = std::iter::once(("token_embd.weight", [2u64, 1], vec![0f32; 2])).chain(tensors.iter().map(|(n, d, v)| (*n, *d, v.clone())));
+    let mut off = 0u64;
+    for (name, dims, _) in all.clone() {
+        w_str(&mut b, name);
+        b.extend(2u32.to_le_bytes());
+        for d in dims { b.extend(d.to_le_bytes()); }
+        b.extend(0u32.to_le_bytes()); // F32
+        b.extend(off.to_le_bytes());
+        off += (dims[0] * dims[1] * 4).next_multiple_of(32);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let mut data = Vec::new();
+    for (_, _, v) in all { data.extend(v.iter().flat_map(|x| x.to_le_bytes())); data.resize(data.len().next_multiple_of(32), 0); }
+    b.extend(data);
+    let p = std::env::temp_dir().join(format!("strata-{}-{tag}.gguf", std::process::id()));
+    std::fs::write(&p, &b).unwrap();
+    let g = Gguf::open(&p).unwrap();
+    std::fs::remove_file(&p).ok();
+    g
+}
+
+/// Files that fuse gate and up experts in `ffn_gate_up_exps.weight` (gpt-oss convention: per expert the gate rows,
+/// then the up rows): `Weights::expert` returns the requested half; split files keep taking the stacked path.
+#[test]
+fn fused_gate_up_experts() {
+    let vals = |lo: f32| (0..12).map(|i| lo + i as f32).collect();
+    let g = qwen35moe_syn("fused", &[("blk.0.ffn_gate_up_exps.weight", [2, 12], (0..24).map(|i| i as f32).collect())]);
+    let w = Weights::new(&g).unwrap();
+    assert!(w.gate_up_fused(0) && !w.gate_up_fused(1));
+    assert_eq!(w.expert(0, "ffn_gate_exps.weight", 1, 3).unwrap().to_f32(), vec![8.0, 9.0, 10.0, 11.0]);
+    assert_eq!(w.expert(0, "ffn_up_exps.weight", 1, 3).unwrap().to_f32(), vec![12.0, 13.0, 14.0, 15.0]);
+    let e = w.expert(0, "ffn_down_exps.weight", 1, 3).err().unwrap().to_string();
+    assert!(e.contains("blk.0.ffn_down_exps.weight"), "{e}");
+    let g = qwen35moe_syn("split", &[("blk.0.ffn_gate_exps.weight", [2, 6], vals(0.0)), ("blk.0.ffn_up_exps.weight", [2, 6], vals(10.0))]);
+    let w = Weights::new(&g).unwrap();
+    assert!(!w.gate_up_fused(0));
+    assert_eq!(w.expert(0, "ffn_gate_exps.weight", 1, 3).unwrap().to_f32(), vec![4.0, 5.0, 6.0, 7.0]);
+    assert_eq!(w.expert(0, "ffn_up_exps.weight", 1, 3).unwrap().to_f32(), vec![14.0, 15.0, 16.0, 17.0]);
+}
+
 /// One shard: `split.count` (u16) = 2 and one 4-float F32 tensor `name` holding `v`.
 fn shard(name: &str, v: f32) -> Vec<u8> {
     let mut b = Vec::new();
