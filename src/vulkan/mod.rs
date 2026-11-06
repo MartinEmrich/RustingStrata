@@ -838,7 +838,10 @@ impl Vk {
         let (spec, grid, nk) = (self.wspec(ty), [rows.div_ceil(64), n_tiles, 1], (cols / 64) as u32);
         // A dense GEMM of few workgroups runs as gemm_fs/gemmi_s (cooperative matrices only), 32 positions a
         // workgroup (as on CUDA).
-        let f = !crate::cuda::Gpu::mmq(ty) || cols % 128 != 0;
+        // GCN (vk-wave64) has no DP4A: the driver emulates the int8 dots and the f16-dequant gemm_f_dp wins by a
+        // wide margin (RX 580: 1.8x the GEMM speed) — int8 products only when STRATA_MMQ asks for them.
+        let i8 = if cfg!(feature = "vk-wave64") { !matches!(ty, GgmlType::F32 | GgmlType::BF16) && std::env::var("STRATA_MMQ").is_ok_and(|v| v.split(',').any(|t| t == ty.name())) } else { crate::cuda::Gpu::mmq(ty) };
+        let f = !i8 || cols % 128 != 0;
         let sm = tiles == 0 && grid[0] * grid[1] < 112 && if f { self.0.coop } else { self.0.coop_i8 };
         let grid = if sm { [grid[0], nd.div_ceil(32), 1] } else { grid };
         let (same, act) = (act & SAME_X != 0, act & !SAME_X);

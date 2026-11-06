@@ -15,9 +15,12 @@ Needs a Vulkan 1.3 driver. By generation:
 The wave64 build runs every kernel as two 32-lane warps per 64-lane wave and does the f16 KV-cache conversions with
 integer ops; it is otherwise the same binary. GCN has no cooperative matrices (prefill uses the slower `dp` kernels,
 as on RDNA) and no device-coherent memory (the expert mailbox is cached by the GPU until a submission ends, so decode
-runs pipelined; see below). Its int8 dot products are emulated by the driver (exact results, slower), and the fp64
-RoPE runs at 1/16 rate — both correct, mildly slow. One measured data point (RX 580 8 GB, Qwen3.6-35B-A3B Q3_K_M,
-3816/10240 experts resident): 23 tok/s decode with experts on the CPU, 37 tok/s prefill — prefill is the weak spot.
+runs pipelined; see below). GCN also has no int8 dot-product instruction: prefill GEMMs therefore dequantize to f16
+(the fast choice; `STRATA_MMQ=<types>` forces the exact-but-slower int8 path), while decode GEMVs use driver-emulated
+int8 dots. The fp64 RoPE runs at 1/16 rate on GCN — correct, mildly slow. One measured data point
+(RX 580 8 GB, Qwen3.6-35B-A3B Q3_K_M, 3816/10240 experts resident): 26 tok/s
+decode with experts on the CPU, 56 tok/s prefill at `--pp 128` (short prompts pay the expert staging cost; at
+`--pp 2048` the same model prefills at 278 tok/s).
 
 ## First line of the output
 
