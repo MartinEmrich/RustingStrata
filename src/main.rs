@@ -32,7 +32,7 @@ struct Engine {
     #[arg(long, default_value_t = 512)]
     vram_margin: usize,
     /// Speculative decoding with the model's MTP draft head, N drafts per step (GPU; greedy output unchanged, sampling keeps its distribution)
-    /// [default: calibrated, else 0].
+    /// [default: calibrated, else 0]. At most 3 drafts: a verify runs N+1 tokens in one forward.
     #[arg(long, value_name = "N", default_missing_value = "1", num_args = 0..=1)]
     mtp: Option<usize>,
     /// Sampling temperature; 0 is greedy.
@@ -163,6 +163,8 @@ impl Engine {
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.
         if let Some(n) = self.threads.or(get("threads")) { let _ = rayon::ThreadPoolBuilder::new().num_threads(n).build_global(); }
         let Some(bk) = bk else { return Ok(Runner::Cpu(m, State::new(&m.cfg))) };
+        let tmax = rusting_strata::cpu_worker::TMAX - 1;
+        anyhow::ensure!(self.mtp() <= tmax, "--mtp: {} drafts per step (at most {tmax}: a verify runs N+1 tokens in one forward)", self.mtp());
         if self.fixed_experts { unsafe { std::env::set_var("STRATA_FIXED_EXPERTS", "1") } }  // read by ExpertCache::new
         let mut g = GpuModel::load_split(m, bk, self.ctx, self.chunk(), self.vram_margin << 20, self.mtp()).context(LOAD_HINT)?;
         g.short = self.short;

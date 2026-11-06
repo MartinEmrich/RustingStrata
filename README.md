@@ -114,7 +114,8 @@ whether the previous request started with the same messages, so do not share one
 not learn each other's prompts.
 
 Useful flags: `--ctx` (KV cache size, default 4096), `--mtp [N]` (speculative decoding with the model's draft
-head; greedy tokens stay the same, sampling keeps its distribution), `--chunk`, `--threads`, `--vram-margin`. On a
+head; greedy tokens stay the same, sampling keeps its distribution; at most 3 drafts per step), `--chunk`,
+`--threads`, `--vram-margin`. On a
 GPU that drives no display, `--vram-margin 256` keeps more experts resident (+1-2% prefill); 128 runs out of
 memory. `--kv q8` halves the KV cache (345 instead of 650 MB at 32K) at about 6% slower 32K decode and 14% slower
 32K prefill. Without `--gpu` everything runs on the CPU reference, which is slow and meant for checking.
