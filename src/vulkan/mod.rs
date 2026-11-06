@@ -10,9 +10,10 @@ use ash::vk;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// Host-visible buffer that host copies go through, in chunks of this size.
-const STAGING: usize = 64 << 20;
+/// Host-visible buffer that host copies go through, in chunks of this size (defaults; `Inner::ring` and
+/// `Inner::submit_b` carry the `STRATA_VK_RING_MB` / `STRATA_VK_SUBMIT_MB` overrides).
 /// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
+const STAGING: usize = 64 << 20;
 const SUBMIT_BYTES: usize = 4 << 20;
 
 /// SPIR-V of every kernel, from `tools/gen_spirv.sh`: the wave32 set (NVIDIA, AMD RDNA), or the wave64 set for AMD
@@ -144,6 +145,10 @@ struct Inner {
     /// the compute family, which every buffer is shared between.
     tq: Option<vk::Queue>,
     qfs: [u32; 2],
+    /// The host-visible upload ring size (`STAGING`, STRATA_VK_RING_MB) and the bytes accumulated per transfer
+    /// submit (`SUBMIT_BYTES`, STRATA_VK_SUBMIT_MB): fewer, larger submits and a deeper ring stream experts faster.
+    ring: usize,
+    submit_b: usize,
     /// Timeline semaphores signalled by each compute submit (`State::cval`) and transfer submit (`State::tval`).
     csem: vk::Semaphore,
     tsem: vk::Semaphore,
@@ -437,8 +442,11 @@ impl Vk {
         let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
         unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
         let subgroup_pin = sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE);
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, subgroup_pin, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
-        let staging = inner.buffer(STAGING, HOST)?;
+        let mb = |v: &str| std::env::var(v).ok().and_then(|x| x.parse::<usize>().ok()).map(|m| m << 20).filter(|b| *b >= 1 << 20);
+        let ring = mb("STRATA_VK_RING_MB").filter(|b| *b <= 1 << 30).unwrap_or(STAGING);
+        let submit_b = mb("STRATA_VK_SUBMIT_MB").filter(|b| *b <= ring / 2).unwrap_or(SUBMIT_BYTES.min(ring / 2));
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], ring, submit_b, csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, subgroup_pin, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let staging = inner.buffer(ring, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
         st.staging = staging;
@@ -909,29 +917,29 @@ impl Backend for Vk {
         // streamed in prefill) overlaps each copy on the GPU with the host filling the next.
         ensure!(st.rec.is_none(), "a host copy while recording a graph");
         if st.beside {
-            for (i, c) in src.chunks(STAGING).enumerate() {
-                if st.staged + c.len() > STAGING {
+            for (i, c) in src.chunks(self.0.ring).enumerate() {
+                if st.staged + c.len() > self.0.ring {
                     // Wrap to the start of the ring, past the copies of the open command buffer.
                     if st.cstaged { self.0.flush(&mut st)?; } else { self.0.tsubmit(&mut st)?; st.staged = 0; }
                 }
                 let at = st.staged;
                 self.0.ring_wait(&mut st, at, c.len())?;
-                let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
+                let (b, o) = st.find(dst.addr() + (off + i * self.0.ring) as u64, c.len())?;
                 unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
                 let cb = self.0.topen(&mut st)?;
                 let r = vk::BufferCopy::default().src_offset(at as u64).dst_offset(o).size(c.len() as u64);
                 unsafe { self.0.dev.cmd_copy_buffer(cb, st.staging.0, b, &[r]) };
                 st.staged = (at + c.len()).next_multiple_of(256);
                 st.tbytes += c.len();
-                if st.tbytes >= SUBMIT_BYTES { self.0.tsubmit(&mut st)?; }
+                if st.tbytes >= self.0.submit_b { self.0.tsubmit(&mut st)?; }
             }
             return Ok(());
         }
-        for (i, c) in src.chunks(STAGING).enumerate() {
-            if st.staged + c.len() > STAGING { self.0.flush(&mut st)?; }
+        for (i, c) in src.chunks(self.0.ring).enumerate() {
+            if st.staged + c.len() > self.0.ring { self.0.flush(&mut st)?; }
             // Submit the work recorded so far first, so the GPU runs it while the host fills staging.
             if st.cur.is_some() && st.ops != st.copied.0 { self.0.submit(&mut st, None, false)?; }
-            let (b, o) = st.find(dst.addr() + (off + i * STAGING) as u64, c.len())?;
+            let (b, o) = st.find(dst.addr() + (off + i * self.0.ring) as u64, c.len())?;
             let at = st.staged;
             self.0.ring_wait(&mut st, at, c.len())?;
             unsafe { std::ptr::copy_nonoverlapping(c.as_ptr(), (st.map + at) as *mut u8, c.len()) };
@@ -943,7 +951,7 @@ impl Backend for Vk {
             st.staged = (at + c.len()).next_multiple_of(256);
             st.cstaged = true;
             st.copied = (st.ops, st.copied.1 + c.len());
-            if st.copied.1 >= SUBMIT_BYTES { self.0.submit(&mut st, None, false)?; }
+            if st.copied.1 >= self.0.submit_b { self.0.submit(&mut st, None, false)?; }
         }
         Ok(())
     }
@@ -951,8 +959,8 @@ impl Backend for Vk {
     fn dtoh(&self, src: &Buf, off: usize, dst: &mut [u8]) -> anyhow::Result<()> {
         ensure!(off + dst.len() <= src.len(), "dtoh: {} bytes at {off} from {}", dst.len(), src.len());
         let mut st = self.0.st();
-        for (i, c) in dst.chunks_mut(STAGING).enumerate() {
-            let (b, o) = st.find(src.addr() + (off + i * STAGING) as u64, c.len())?;
+        for (i, c) in dst.chunks_mut(self.0.ring).enumerate() {
+            let (b, o) = st.find(src.addr() + (off + i * self.0.ring) as u64, c.len())?;
             self.0.ring_wait(&mut st, 0, c.len())?;  // transfer-queue copies may still read staging
             let cb = self.0.cb(&mut st)?;
             let r = vk::BufferCopy::default().src_offset(o).size(c.len() as u64);

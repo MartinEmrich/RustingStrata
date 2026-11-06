@@ -7,6 +7,7 @@ use crate::backend::{Backend, Buf, GEMM_BM, SAME_X};
 use crate::expert_cache::MATS;
 use crate::model::Model;
 use crate::weights::Prefetch;
+use std::time::{Duration, Instant};
 
 /// Experts staged per group when a layer routes to experts outside the cache. Staging holds three groups.
 const STAGE: usize = 16;
@@ -202,6 +203,10 @@ impl GpuModel<'_> {
         // STRATA_NAN_TRACE: one line per layer with the largest magnitude of each intermediate buffer, and the first
         // row of one holding a non-finite value. Each probe waits for the GPU: diagnostic runs only.
         let trace = std::env::var_os("STRATA_NAN_TRACE").is_some();
+        // STRATA_PF_PROF: per-chunk host-side wall-time split: waiting for the GPU (the `get` after the router),
+        // the host sort and re-upload, and the rest (enqueue, staging copies, kicks); plus staged MB.
+        let prof = std::env::var_os("STRATA_PF_PROF").is_some();
+        let (mut t_sync, mut t_sort, mut staged, mut layers, w0) = (Duration::ZERO, Duration::ZERO, 0usize, 0usize, Instant::now());
         let mut tr = String::new();
         let probe = |tr: &mut String, what: &str, b: &Buf, o: u64, w: usize, rows: usize| -> anyhow::Result<()> {
             if !trace { return Ok(()); }
@@ -337,7 +342,9 @@ impl GpuModel<'_> {
                     };
                     probe(&mut tr, "router", &pf.slab, at(l.rl), c.n_expert, t)?;
                     probe(&mut tr, "weights", &pf.slab, at(l.wts), k, t)?;
+                    let s0 = Instant::now();
                     let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
+                    let s1 = Instant::now();
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
                     // Sort (token, j) pairs by expert: slot s holds token xrow[s]; inv maps t * k + j to its slot.
@@ -353,10 +360,14 @@ impl GpuModel<'_> {
                     }
                     g.put(&xrow, &pf.ints, n * k)?;
                     g.put(&inv, &pf.ints, 2 * n * k)?;
+                    let s2 = Instant::now();
                     let lx = cache.layer(il).unwrap();
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
+                    if prof {
+                        (t_sync, t_sort, staged, layers) = (t_sync + (s1 - s0), t_sort + (s2 - s1), staged + missed.len() * lx.mats.iter().map(|m| m.bytes).sum::<usize>(), layers + 1);
+                    }
                     if let Some(pre) = &pre {
                         let w: Vec<_> = MATS.iter().map(|name| self.m.w.layer(il, name)).collect::<anyhow::Result<_>>()?;
                         pre.send(missed.chunks(STAGE).flat_map(|grp| w.iter().zip(&lx.mats).flat_map(move |(w, mat)| grp.chunk_by(|a, b| *b == a + 1)
@@ -471,6 +482,10 @@ impl GpuModel<'_> {
             probe(&mut tr, "| ffn", &pf.slab, x, d, t)?;
             if trace { eprintln!("nan-trace pos {} layer {il}:{tr}", self.pos); tr.clear(); }
             g.kick()?;
+        }
+        if prof {
+            let (sync, sort, all) = (t_sync.as_secs_f64() * 1e3, t_sort.as_secs_f64() * 1e3, w0.elapsed().as_secs_f64() * 1e3);
+            eprintln!("prefill prof: {t} tokens, {layers} MoE layers, wall {all:.0} ms: GPU wait {sync:.0} ms, sort+put {sort:.0} ms, rest {:.0} ms, staged {} MB", all - sync - sort, staged >> 20);
         }
         match self.mtp.as_mut() {
             Some(mh) if fill => mh.pos += t,

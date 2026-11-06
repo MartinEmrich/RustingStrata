@@ -70,7 +70,12 @@ Environment variables; set any of them to turn the feature off:
 - `STRATA_VK_NO_COOP`: no cooperative matrices.
 - `STRATA_VK_NO_COND`: no conditional rendering.
 - `STRATA_VK_NO_TQ`: no separate transfer queue for expert uploads.
+- `STRATA_VK_RING_MB` / `STRATA_VK_SUBMIT_MB`: upload ring size and bytes per upload submit (64 / 4); raising both
+  helps a few percent on cards without a transfer queue.
 - `radv_device_coherent_memory=false`: undo the RADV option strata sets.
+
+For a slow-prefill report, `STRATA_PF_PROF=1` (host-side split per chunk: GPU wait, expert sort, staging) and
+`STRATA_VK_PROF=1` (per-kernel GPU times) print tables at exit; attach both.
 
 If one of these makes a problem go away, say which one in the report.
 
