@@ -70,10 +70,12 @@ fn spirv_is_fresh() {
     let st = std::process::Command::new("tools/gen_spirv.sh").arg(&tmp).status().unwrap();
     assert!(st.success());
     let names = |d: &std::path::Path| { let mut v: Vec<_> = std::fs::read_dir(d).unwrap().map(|e| e.unwrap().file_name()).collect(); v.sort(); v };
-    let committed = std::path::Path::new("src/vulkan/spv");
-    assert_eq!(names(&tmp), names(committed), "run tools/gen_spirv.sh");
-    for n in names(&tmp) {
-        assert!(std::fs::read(tmp.join(&n)).unwrap() == std::fs::read(committed.join(&n)).unwrap(), "{n:?} is stale: run tools/gen_spirv.sh");
+    for d in ["spv", "spv64"] {
+        let (out, committed) = (tmp.join(d), std::path::Path::new("src/vulkan").join(d));
+        assert_eq!(names(&out), names(&committed), "run tools/gen_spirv.sh");
+        for n in names(&out) {
+            assert!(std::fs::read(out.join(&n)).unwrap() == std::fs::read(committed.join(&n)).unwrap(), "{d}/{n:?} is stale: run tools/gen_spirv.sh");
+        }
     }
     std::fs::remove_dir_all(&tmp).unwrap();
 }

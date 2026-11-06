@@ -4,7 +4,20 @@ All benchmarks in the README were run on an NVIDIA RTX 3060. AMD GPUs run the Vu
 (`--backend vulkan`), and everything known about them comes from user reports (RX 9070 XT on Linux with RADV, and on
 Windows with AMD's driver). Expect problems; this page lists the known ones and what to send when you hit a new one.
 
-Needs RDNA or newer (older AMD GPUs lack subgroup size 32) and a Vulkan 1.3 driver.
+Needs a Vulkan 1.3 driver. By generation:
+
+| GPU | Build |
+| --- | --- |
+| RDNA 1 and newer (RX 5000, 6000, 7000, 9000) | default: `cargo build --release` |
+| GCN 4 and 5 (RX 400/500, Polaris, Vega) | `cargo build --release --features vk-wave64` (wave64 subgroups, no f16) |
+| older GCN (Tahiti to Fury) | untested; the wave64 build is the one to try |
+
+The wave64 build runs every kernel as two 32-lane warps per 64-lane wave and does the f16 KV-cache conversions with
+integer ops; it is otherwise the same binary. GCN has no cooperative matrices (prefill uses the slower `dp` kernels,
+as on RDNA) and no device-coherent memory (the expert mailbox is cached by the GPU until a submission ends, so decode
+runs pipelined; see below). Its int8 dot products are emulated by the driver (exact results, slower), and the fp64
+RoPE runs at 1/16 rate — both correct, mildly slow. One measured data point (RX 580 8 GB, Qwen3.6-35B-A3B Q3_K_M,
+3816/10240 experts resident): 23 tok/s decode with experts on the CPU, 37 tok/s prefill — prefill is the weak spot.
 
 ## First line of the output
 
@@ -14,7 +27,9 @@ Every run on Vulkan starts with a line like:
 vulkan: AMD Radeon RX 9070 XT (radv Mesa 26.2.5), device-coherent memory yes, cooperative matrix f16 yes int8 no, conditional rendering yes
 ```
 
-- `device-coherent memory` must be `yes` for models whose experts do not all fit in VRAM (see below).
+- `device-coherent memory` must be `yes` for models whose experts do not all fit in VRAM (see below). GCN never has it:
+  there the GPU caches the mailbox until a submission ends, so a wave64 build pipelines decode instead (one layer per
+  submission, which costs a little); `STRATA_VK_NO_PIPE=1` turns that off.
 - `cooperative matrix` speeds up prefill. `int8 no` is normal on RDNA.
 - `conditional rendering` lets decode recover when the CPU expert worker is slow. With `no`, a slow worker is an error.
 
@@ -26,7 +41,9 @@ GPU caches that buffer unless it comes from device-coherent memory (`VK_AMD_devi
 the answer and waits until it gives up. RADV hides the extension on RDNA4 (RX 9000) unless the driconf option
 `radv_device_coherent_memory` is set. Strata sets it before it opens Vulkan (unless you set it yourself) and prints a
 warning when an AMD GPU still has no device-coherent memory. If the first line says `device-coherent memory no`, send
-the output of `vulkaninfo | grep -i coherent`. A few resumed waits on a busy CPU are normal; hundreds are not.
+the output of `vulkaninfo | grep -i coherent`. A few resumed waits on a busy CPU are normal; hundreds are not. On GCN
+(RX 400/500, Vega) the answer never becomes visible at all during a submission, so a wave64 build pipelines decode
+(one layer per submission) and these resumes should not appear; hundreds still mean a bug.
 
 **The GPU resets during a long prefill.** amdgpu resets a submission that runs for more than 10 s. Prefill submits
 each layer separately to stay under that. If it still happens, try a smaller `--chunk`.

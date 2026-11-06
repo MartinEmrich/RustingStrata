@@ -1,5 +1,28 @@
 // Shared by every kernel; include it after the local size. Pointers arrive as buffer references in the push
 // constants; the CUDA counterparts are in src/cuda/kernels.cu.
+
+// Wave size the kernels are compiled for: 32 (NVIDIA, AMD RDNA) or 64 (AMD GCN, --features vk-wave64). Kernels are
+// written against 32-lane warps; a wave64 subgroup hosts two logical warps, and since every shuffle offset used
+// here is <= 16, XOR butterflies never cross the halves and each half computes exactly the wave32 result.
+#ifndef SUBGROUP_SIZE
+#define SUBGROUP_SIZE 32
+#endif
+// f16 arithmetic (the shaderFloat16 feature): 0 on GCN, where every f16 rounding goes through integer bit tricks
+// (rh, f2h, packHalf2x16) instead of float16_t operations.
+#ifndef F16
+#define F16 1
+#endif
+#define WARPS_PER_SUBGROUP (SUBGROUP_SIZE / 32)
+#if SUBGROUP_SIZE == 32
+#define LANE (gl_SubgroupInvocationID)
+#define LW (gl_SubgroupID)
+#define Nlw (gl_NumSubgroups)
+#else
+#define LANE (gl_SubgroupInvocationID & 31u)
+#define LW (gl_SubgroupID * WARPS_PER_SUBGROUP + (gl_SubgroupInvocationID >> 5u))
+#define Nlw (gl_NumSubgroups * WARPS_PER_SUBGROUP)
+#endif
+
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -65,18 +88,33 @@ float log1p_(float a) {
 }
 float softplus(float x) { return x > 20.0 ? x : log1p_(expf_(x)); }
 
-// Sums and maxima over a subgroup of 32 in the butterfly order of the CUDA warp_sum / warp_max.
+// Sums and maxima over a logical warp of 32 in the butterfly order of the CUDA warp_sum / warp_max. Offsets <= 16
+// pair lanes within one half of a wave64 subgroup, so the halves reduce independently and get the same values.
 float warp_sum(float v) { for (uint o = 16; o > 0; o >>= 1) v += subgroupShuffleXor(v, o); return v; }
 float warp_max(float v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
+float warp_min(float v) { for (uint o = 16; o > 0; o >>= 1) v = min(v, subgroupShuffleXor(v, o)); return v; }
+uint warp_max_u(uint v) { for (uint o = 16; o > 0; o >>= 1) v = max(v, subgroupShuffleXor(v, o)); return v; }
+uint warp_min_u(uint v) { for (uint o = 16; o > 0; o >>= 1) v = min(v, subgroupShuffleXor(v, o)); return v; }
+// Inclusive prefix sum over a logical warp of 32 (integers: exact, order-free).
+uint warp_inclusive_add(uint v) {
+    for (uint o = 1; o < 32; o <<= 1) { uint u = subgroupShuffleXor(v, o); if (LANE >= o) v += u; }
+    return v;
+}
 
 // Sum over the workgroup; every invocation gets the result. Call in uniform control flow.
 shared float block_sum_s[32];
 float block_sum(float v) {
     v = warp_sum(v);
     barrier();
+#if SUBGROUP_SIZE == 32
     if (gl_SubgroupInvocationID == 0) block_sum_s[gl_SubgroupID] = v;
     barrier();
     return warp_sum(gl_SubgroupInvocationID < gl_NumSubgroups ? block_sum_s[gl_SubgroupInvocationID] : 0.0);
+#else
+    if (LANE == 0u) block_sum_s[LW] = v;
+    barrier();
+    return warp_sum(LANE < Nlw ? block_sum_s[LANE] : 0.0);
+#endif
 }
 
 // QSA mask (see qsa_select): whether query row t (mw words a row) sees key position `key`.
@@ -111,7 +149,11 @@ void kv_put(U16 c, uint e, uint hd, float x) {
 }
 // The cache value at offset off. q8: q * d rounded once to f16 (the product is exact in f32), as ldkv in kernels.cu.
 float ldkv(U16 c, uint off, uint hd) {
+#if F16
     if (!KV_Q8) return float(uint16BitsToHalf(c.v[off]));
+#else
+    if (!KV_Q8) return unpackHalf2x16(uint(c.v[off])).x;
+#endif
     uint w = off % hd, r = off / hd * (hd + hd / 16);
     float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
     return rh(float(int(uint(U8(uint64_t(c)).v[r + w]) << 24) >> 24) * d);
@@ -130,9 +172,17 @@ uvec2 ldkv4(U16 c, uint off, uint hd) {
     // q + 128 as the low mantissa bits of 1024 gives the f16 1152 + q, so q comes out exact without int -> float
     // converts. The f16 product q * d is rounded once, as rh(float(q) * d).
     uint x = b ^ 0x80808080u, lo = (x & 0xffu) | (x & 0xff00u) << 8, hi = (x >> 16 & 0xffu) | (x >> 8 & 0xff0000u);
+#if F16
     float16_t d = uint16BitsToHalf(c.v[(r + hd) / 2 + w / 32]);
     precise f16vec2 m = f16vec2(1152.0hf), a = (unpackFloat2x16(lo | 0x64006400u) - m) * d, z = (unpackFloat2x16(hi | 0x64006400u) - m) * d;
     return uvec2(packFloat2x16(a), packFloat2x16(z));
+#else
+    // The same single rounding without f16 arithmetic: q and d are f16-exact, their f32 product is exact, and
+    // packHalf2x16 rounds it to f16 once.
+    float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
+    precise vec2 a = (unpackHalf2x16(lo | 0x64006400u) - vec2(1152.0)) * d, z = (unpackHalf2x16(hi | 0x64006400u) - vec2(1152.0)) * d;
+    return uvec2(packHalf2x16(a), packHalf2x16(z));
+#endif
 }
 
 // sin and cos of theta = pos * ts^i (ts = base^(-2 / n_rot) from the host) in f64, as the CPU and CUDA take them

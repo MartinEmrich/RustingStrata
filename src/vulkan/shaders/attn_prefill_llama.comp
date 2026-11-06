@@ -8,10 +8,14 @@ layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step
 const uint R = (HD + 127) / 128;
 shared float sq[HD], sc[32];
 
+#if F16
 float hf(uint16_t b) { return float(uint16BitsToHalf(b)); }
+#else
+float hf(uint16_t b) { return unpackHalf2x16(uint(b)).x; }
+#endif
 
 void main() {
-    uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x, w = gl_SubgroupID, lane = gl_SubgroupInvocationID;
+    uint t = gl_WorkGroupID.x, h = gl_WorkGroupID.y, tid = gl_LocalInvocationID.x, w = LW, lane = LANE;
     uint kvh = h / (p.nh / p.nkv), last = uint(p.step.v[0]) + t;
     for (uint d = tid; d < HD; d += 128) sq[d] = p.q.v[(t * p.nh + h) * HD + d];
     precise float acc[R], l = 0.0;

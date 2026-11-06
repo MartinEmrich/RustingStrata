@@ -9,6 +9,7 @@ shared uint ws[32];
 
 // Exclusive prefix sum over the workgroup; tot gets the total.
 uint block_scan(uint v, out uint tot) {
+#if SUBGROUP_SIZE == 32
     uint x = subgroupInclusiveAdd(v), w = gl_SubgroupID;
     barrier();
     if (gl_SubgroupInvocationID == 31) ws[w] = x;
@@ -17,6 +18,19 @@ uint block_scan(uint v, out uint tot) {
     barrier();
     tot = ws[31];
     return x - v + (w > 0 ? ws[w - 1] : 0);
+#else
+    uint x = warp_inclusive_add(v), w = LW;  // per-half scan: exact integers, one entry per logical warp
+    barrier();
+    if (LANE == 31u) ws[w] = x;
+    barrier();
+    if (gl_SubgroupID == 0) {  // both halves scan the same input and agree; only the first writes
+        uint s = warp_inclusive_add(ws[LANE]);
+        if ((gl_SubgroupInvocationID >> 5u) == 0u) ws[LANE] = s;
+    }
+    barrier();
+    tot = ws[31];
+    return x - v + (w > 0 ? ws[w - 1] : 0);
+#endif
 }
 
 void main() {

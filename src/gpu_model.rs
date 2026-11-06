@@ -29,6 +29,17 @@ mod prefill;
 #[derive(Clone, Copy)]
 struct HcAt { xn: u64, lo: u64, hg: u64, inj: u64, h: u64, hq: u64, emb: u64, pk: u64, pq: u64, pg: u64, pn: u64, pv: u64, gemm: bool }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Phase {
+    /// Everything: attention/norms, then the FFN with its combine (the non-pipelined forward).
+    Full,
+    /// Everything but the MoE combine (and the hyper-connection write behind it): the combine of the previous MoE
+    /// layer was already run, its answers are in memory before this part was submitted (`forward_pipelined`).
+    Pre,
+    /// Only the MoE combine: its part ran in an earlier submission and left `ge`/`ue`/`ffq`/`shy` in place.
+    Comb,
+}
+
 enum Mixer {
     Delta {
         qkv: GpuTensor, gate: GpuTensor, beta: GpuTensor, alpha: GpuTensor, dt_bias: GpuTensor, a: GpuTensor,
@@ -615,6 +626,7 @@ impl<'a> GpuModel<'a> {
     /// Enqueue (or record into a graph) the forward of `nt` tokens; per-token values come from `step_buf`. `from`:
     /// resume at that layer's MoE combine (see `finish`).
     fn forward(&self, nt: usize, gq: i32, from: Option<usize>) -> anyhow::Result<()> {
+        if self.gpu.expert_pipeline() && self.worker.is_some() { return self.forward_pipelined(nt, gq, from); }
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
         let p = |n: &str| self.bufs[n].addr();
@@ -622,8 +634,44 @@ impl<'a> GpuModel<'a> {
         let mut res = 0;
         for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il - self.first)) {
             let il = self.first + i;
-            res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq, from == Some(il))?;
+            let phase = if from == Some(il) { Phase::Comb } else { Phase::Full };
+            res = self.layer(il, l, x, step, self.worker.as_ref(), nt, res, gq, phase)?;
         }
+        if self.next.is_some() { return if res != 0 { g.add(x, res, nt * ne) } else { Ok(()) }; }
+        match (&self.output_norm, &self.output_hc) {
+            (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
+            (None, Some(hr)) => self.hc_read(hr, x, nt, &self.hc_at())?,
+            _ => unreachable!(),
+        }
+        g.gemvq(self.output.as_ref().unwrap(), p("h"), ne, p("hq"), self.logits.addr(), c.n_vocab, nt)
+    }
+
+    /// The forward for backends whose GPU only sees the host's mailbox writes when the submission that raised the
+    /// request ends (`Backend::expert_pipeline`): each submission ends at an MoE layer, the host waits for that
+    /// layer's answer, and the next submission starts with that layer's combine, whose wait then always succeeds.
+    /// One submission per layer costs a little; a combine that gives up costs about half a second.
+    fn forward_pipelined(&self, nt: usize, gq: i32, from: Option<usize>) -> anyhow::Result<()> {
+        let c = &self.m.cfg;
+        let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
+        let p = |n: &str| self.bufs[n].addr();
+        let x = self.x.addr();
+        let w = self.worker.as_ref().unwrap();
+        let mut res = 0;
+        let mut pending = from;  // MoE layer whose combine is owed: its part ran before the submission that stalled
+        for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il + 1 - self.first)) {
+            let il = self.first + i;
+            if let Some(pl) = pending.take() {
+                self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?;
+                res = 0;
+            }
+            res = self.layer(il, l, x, step, Some(w), nt, res, gq, Phase::Pre)?;
+            if matches!(l.ffn, Ffn::Moe { .. }) {
+                g.sync()?;  // the submission that raised this layer's request ends here
+                w.wait_done(il)?;
+                pending = Some(il);
+            }
+        }
+        if let Some(pl) = pending.take() { self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?; }
         if self.next.is_some() { return if res != 0 { g.add(x, res, nt * ne) } else { Ok(()) }; }
         match (&self.output_norm, &self.output_hc) {
             (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
@@ -799,18 +847,28 @@ impl<'a> GpuModel<'a> {
         Ok(again)
     }
 
-    /// Enqueue the draft head (see `mtp_run`).
+    /// Enqueue the draft head (see `mtp_run`). Pipelined like `forward_pipelined` (one submission before the MoE
+    /// combine, one after) when the GPU only sees the host's mailbox writes at submission boundaries.
     fn mtp_forward(&self, hid: u64, nt: usize, head: bool, gq: i32, resume: bool) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
         let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
         let (eh, x) = (h.eh.addr(), h.x.addr());
+        let pipe = !resume && matches!(h.layer.ffn, Ffn::Moe { .. }) && g.expert_pipeline();
         if !resume {
             g.rms_norm(h.emb.addr(), ne, h.enorm.ptr, eh, 2 * ne, ne, nt, eps)?;
             g.rms_norm(hid, ne, h.hnorm.ptr, eh + 4 * ne as u64, 2 * ne, ne, nt, eps)?;
             self.mv(&h.eh_proj, eh, 2 * ne, x, ne, nt)?;
         }
-        let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, resume)?;
-        if res != 0 { g.add(x, res, nt * ne)?; }
+        if pipe {
+            self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, Phase::Pre)?;
+            g.sync()?;  // the submission that raised the request ends here: only now can the worker's answer be seen
+            h.worker.wait_done(c.n_layer)?;
+            self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, Phase::Comb)?;
+        } else {
+            let res = self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq,
+                                 if resume { Phase::Comb } else { Phase::Full })?;
+            if res != 0 { g.add(x, res, nt * ne)?; }
+        }
         if head {
             g.rms_norm(x + 4 * ((nt - 1) * ne) as u64, 0, h.head_norm.ptr, hp, 0, ne, 1, eps)?;
             g.gemv(self.output.as_ref().unwrap(), hp, self.logits.addr())?;
@@ -823,7 +881,7 @@ impl<'a> GpuModel<'a> {
     /// One layer on x, after adding `res` (the previous layer's pending FFN output, or 0) to it. Returns this
     /// layer's pending FFN output (a dense FFN's, added by the next norm) or 0. `resume`: only the MoE down GEMV and
     /// combine onward, after a combine that gave up waiting for the CPU worker (see `finish`).
-    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64, gq: i32, resume: bool) -> anyhow::Result<u64> {
+    fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64, gq: i32, phase: Phase) -> anyhow::Result<u64> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
         let p = |n: &str| self.bufs[n].addr();
@@ -840,7 +898,7 @@ impl<'a> GpuModel<'a> {
         let (dv, channels) = (c.ssm_dv(), c.ssm_d_inner + 2 * nk * dk);
         let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_head_kv);
         let kv = nkv * hd;
-        if !resume {
+        if phase != Phase::Comb {
             let ha = self.hc_at();
             if let Some(pl) = &l.ple { self.ple(pl, x, step, nt, &ha)?; }
             match (&l.attn_norm, &l.hc) {
@@ -901,7 +959,7 @@ impl<'a> GpuModel<'a> {
         {
             match &l.ffn {
                 Ffn::Dense { gate, up, down } => {
-                    debug_assert!(!resume);
+                    debug_assert!(phase != Phase::Comb);
                     g.batch(&mut || mv2(gate, up, "ge", "ue"))?;
                     let q = sw(down.ty, "ge", "ue", down.cols, nt, "ffq")?;
                     g.gemvq(down, p("ge"), down.cols, q, p("ye"), ne, nt)?;
@@ -920,9 +978,9 @@ impl<'a> GpuModel<'a> {
                     let w = worker.unwrap();
                     let mb = w.dev + (4 * il * w.layout.stride) as u64;
                     // Resuming: what the skipped part left (the swiglu_q of Vulkan, the only backend that resumes).
-                    if resume { dq = if matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { 0 } else { p("ffq") }; }
+                    if phase == Phase::Comb { dq = if matches!(md.ty, GgmlType::F32 | GgmlType::BF16) { 0 } else { p("ffq") }; }
                     // The shared expert's GEMVs and swiglu share batches with the routed ones.
-                    if !resume {
+                    if phase != Phase::Comb {
                     g.batch(&mut || {
                         if let Some(s) = shared {
                             mv2(router, &s.gate_inp, "rl", "sg")?;
@@ -951,9 +1009,11 @@ impl<'a> GpuModel<'a> {
                     let (sh, sg) = if shared.is_some() { (p("shy"), p("sg")) } else { (0, 0) };
                     // Hyper-connections: the FFN output collects in "mo" (zero) and goes to the streams from there.
                     let fx = if l.hc.is_some() { p("mo") } else { x };
-                    g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
-                                       fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
-                    if l.hc.is_some() { g.hc_write(x, p("mo"), p("inj"), ne, c.hc_n, nt, true)?; }
+                    if phase != Phase::Pre {
+                        g.moe_down_combine(md.ty, md.rows, md.cols, base + md.off as u64, stride, slots, k, p("ge"), p("ye"), dq,
+                                           fx, p("wh"), sh, sg, mb, w.layout.y, step, nt)?;
+                        if l.hc.is_some() { g.hc_write(x, p("mo"), p("inj"), ne, c.hc_n, nt, true)?; }
+                    }
                 }
             }
         }

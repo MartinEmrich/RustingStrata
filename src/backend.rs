@@ -112,6 +112,10 @@ pub trait Backend: Send {
     /// added nothing and the rest of that submission was skipped: the caller waits for the worker and runs the
     /// forward again from that combine. Clears the flag. Backends whose combines never give up return false.
     fn stalled(&self) -> bool { false }
+    /// Whether the GPU cannot see the host's mailbox writes until the next submission starts (GCN caches them in its
+    /// L2): `GpuModel::forward` then pipelines one layer per submission, so every combine's answer is already in
+    /// memory when its submission begins and no combine ever waits.
+    fn expert_pipeline(&self) -> bool { false }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;

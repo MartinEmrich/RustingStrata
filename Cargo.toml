@@ -8,6 +8,10 @@ license-file = "LICENSE.md"
 name = "strata"
 path = "src/main.rs"
 
+[features]
+# Vulkan kernels for AMD GCN (RX 500/Vega era): wave64 subgroups and no f16 arithmetic. See POLARIS.md.
+vk-wave64 = []
+
 [dependencies]
 anyhow = "1"
 memmap2 = "0.9"

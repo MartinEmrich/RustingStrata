@@ -15,57 +15,66 @@ const STAGING: usize = 64 << 20;
 /// Staged copies are submitted once this many bytes are queued: a submit per expert matrix costs more than the copy.
 const SUBMIT_BYTES: usize = 4 << 20;
 
-/// SPIR-V of every kernel, from `tools/gen_spirv.sh`.
+/// SPIR-V of every kernel, from `tools/gen_spirv.sh`: the wave32 set (NVIDIA, AMD RDNA), or the wave64 set for AMD
+/// GCN compiled with `--features vk-wave64` (no f16 arithmetic, two 32-lane warps per 64-lane wave).
+#[cfg(not(feature = "vk-wave64"))]
+macro_rules! spv { ($k:literal) => { include_bytes!(concat!("spv/", $k, ".spv")) } }
+#[cfg(feature = "vk-wave64")]
+macro_rules! spv { ($k:literal) => { include_bytes!(concat!("spv64/", $k, ".spv")) } }
+
+/// The wave size the kernels are built for, and the pipelines' required subgroup size.
+const WAVE: u32 = if cfg!(feature = "vk-wave64") { 64 } else { 32 };
+
 const SPV: &[(&str, &[u8])] = &[
-    ("add", include_bytes!("spv/add.spv")),
-    ("argmax_rows", include_bytes!("spv/argmax_rows.spv")),
-    ("attn_decode", include_bytes!("spv/attn_decode.spv")),
-    ("attn_decode_llama", include_bytes!("spv/attn_decode_llama.spv")),
-    ("attn_merge", include_bytes!("spv/attn_merge.spv")),
-    ("attn_prefill_64", include_bytes!("spv/attn_prefill_64.spv")),
-    ("attn_prefill_dp", include_bytes!("spv/attn_prefill_dp.spv")),
-    ("attn_prefill_llama", include_bytes!("spv/attn_prefill_llama.spv")),
-    ("attn_prefill_128", include_bytes!("spv/attn_prefill_128.spv")),
-    ("attn_prefill_256", include_bytes!("spv/attn_prefill_256.spv")),
-    ("conv_silu", include_bytes!("spv/conv_silu.spv")),
-    ("conv_seq", include_bytes!("spv/conv_seq.spv")),
-    ("conv_state", include_bytes!("spv/conv_state.spv")),
-    ("deltanet", include_bytes!("spv/deltanet.spv")),
-    ("dequant", include_bytes!("spv/dequant.spv")),
-    ("gemm_f", include_bytes!("spv/gemm_f.spv")),
-    ("gemm_f_dp", include_bytes!("spv/gemm_f_dp.spv")),
-    ("gemm_fs", include_bytes!("spv/gemm_fs.spv")),
-    ("gemmi", include_bytes!("spv/gemmi.spv")),
-    ("gemmi_dp", include_bytes!("spv/gemmi_dp.spv")),
-    ("gemmi_s", include_bytes!("spv/gemmi_s.spv")),
-    ("gemv_f", include_bytes!("spv/gemv_f.spv")),
-    ("gemv_q", include_bytes!("spv/gemv_q.spv")),
-    ("hc_mix", include_bytes!("spv/hc_mix.spv")),
-    ("hc_silu", include_bytes!("spv/hc_silu.spv")),
-    ("hc_write", include_bytes!("spv/hc_write.spv")),
-    ("kv_store", include_bytes!("spv/kv_store.spv")),
-    ("l2_norm", include_bytes!("spv/l2_norm.spv")),
-    ("moe_combine", include_bytes!("spv/moe_combine.spv")),
-    ("moe_down_combine", include_bytes!("spv/moe_down_combine.spv")),
-    ("moe_combine_seq", include_bytes!("spv/moe_combine_seq.spv")),
-    ("moe_gemv_f", include_bytes!("spv/moe_gemv_f.spv")),
-    ("moe_gemv_q", include_bytes!("spv/moe_gemv_q.spv")),
-    ("moe_route", include_bytes!("spv/moe_route.spv")),
-    ("norm_gate", include_bytes!("spv/norm_gate.spv")),
-    ("ple_conv", include_bytes!("spv/ple_conv.spv")),
-    ("ple_gate", include_bytes!("spv/ple_gate.spv")),
-    ("quant_q8", include_bytes!("spv/quant_q8.spv")),
-    ("quant_xq", include_bytes!("spv/quant_xq.spv")),
-    ("qsa_pool", include_bytes!("spv/qsa_pool.spv")),
-    ("qsa_score", include_bytes!("spv/qsa_score.spv")),
-    ("qsa_select", include_bytes!("spv/qsa_select.spv")),
-    ("rms_norm", include_bytes!("spv/rms_norm.spv")),
-    ("rope_neox", include_bytes!("spv/rope_neox.spv")),
-    ("router_topk", include_bytes!("spv/router_topk.spv")),
-    ("ssm_gates", include_bytes!("spv/ssm_gates.spv")),
-    ("swiglu", include_bytes!("spv/swiglu.spv")),
+    ("add", spv!("add")),
+    ("argmax_rows", spv!("argmax_rows")),
+    ("attn_decode", spv!("attn_decode")),
+    ("attn_decode_llama", spv!("attn_decode_llama")),
+    ("attn_merge", spv!("attn_merge")),
+    ("attn_prefill_64", spv!("attn_prefill_64")),
+    ("attn_prefill_dp", spv!("attn_prefill_dp")),
+    ("attn_prefill_llama", spv!("attn_prefill_llama")),
+    ("attn_prefill_128", spv!("attn_prefill_128")),
+    ("attn_prefill_256", spv!("attn_prefill_256")),
+    ("conv_silu", spv!("conv_silu")),
+    ("conv_seq", spv!("conv_seq")),
+    ("conv_state", spv!("conv_state")),
+    ("deltanet", spv!("deltanet")),
+    ("dequant", spv!("dequant")),
+    ("gemm_f", spv!("gemm_f")),
+    ("gemm_f_dp", spv!("gemm_f_dp")),
+    ("gemm_fs", spv!("gemm_fs")),
+    ("gemmi", spv!("gemmi")),
+    ("gemmi_dp", spv!("gemmi_dp")),
+    ("gemmi_s", spv!("gemmi_s")),
+    ("gemv_f", spv!("gemv_f")),
+    ("gemv_q", spv!("gemv_q")),
+    ("hc_mix", spv!("hc_mix")),
+    ("hc_silu", spv!("hc_silu")),
+    ("hc_write", spv!("hc_write")),
+    ("kv_store", spv!("kv_store")),
+    ("l2_norm", spv!("l2_norm")),
+    ("moe_combine", spv!("moe_combine")),
+    ("moe_down_combine", spv!("moe_down_combine")),
+    ("moe_combine_seq", spv!("moe_combine_seq")),
+    ("moe_gemv_f", spv!("moe_gemv_f")),
+    ("moe_gemv_q", spv!("moe_gemv_q")),
+    ("moe_route", spv!("moe_route")),
+    ("norm_gate", spv!("norm_gate")),
+    ("ple_conv", spv!("ple_conv")),
+    ("ple_gate", spv!("ple_gate")),
+    ("quant_q8", spv!("quant_q8")),
+    ("quant_xq", spv!("quant_xq")),
+    ("qsa_pool", spv!("qsa_pool")),
+    ("qsa_score", spv!("qsa_score")),
+    ("qsa_select", spv!("qsa_select")),
+    ("rms_norm", spv!("rms_norm")),
+    ("rope_neox", spv!("rope_neox")),
+    ("router_topk", spv!("router_topk")),
+    ("ssm_gates", spv!("ssm_gates")),
+    ("swiglu", spv!("swiglu")),
     // quant_xq under another name, so that it gets no barrier inside a batch: its output is read after the batch.
-    ("swiglu_q", include_bytes!("spv/quant_xq.spv")),
+    ("swiglu_q", spv!("quant_xq")),
 ];
 
 /// The device, a scratch buffer of XQ bytes for x quantized by `quant_xq` when an op does that itself, the IQ lookup
@@ -114,6 +123,9 @@ const BAR: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(7), 
 /// BAR (and holds its own writes from the host), so the mailbox is memory the GPU does not cache (flags 0x40, 0x80).
 const BAR_AMD: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xc7), vk::MemoryPropertyFlags::from_raw(0xc6),
     vk::MemoryPropertyFlags::from_raw(7), vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
+/// AMD GCN without VK_AMD_device_coherent_memory: the GPU caches its VRAM lines, the BAR aperture included, so the
+/// mailbox must be system memory (no DEVICE_LOCAL), which GCN reads without caching. Cached for the host's polling.
+const SYS: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
 
 /// How long the host waits for a submission before it tells MoE combines still waiting for the CPU worker to give up
 /// (err[2], see `Inner::submit`).
@@ -143,7 +155,11 @@ struct Inner {
     coop_i8: bool,
     /// VK_AMD_device_coherent_memory is enabled (the mailbox uses `BAR_AMD`).
     amd_coherent: bool,
-    /// An AMD GPU without it: the CPU expert mailbox cannot work (the GPU caches it), so a timeout names the fix.
+    /// The driver can pin the subgroup size (`requiredSubgroupSizeStages` has compute): pipelines pin it to `WAVE`.
+    /// GCN cannot (wave64 only, no sizecfg) and needs no pin.
+    subgroup_pin: bool,
+    /// An AMD GPU without it: the mailbox falls back to system memory (`SYS`); the GPU polls it over PCIe, so CPU
+    /// experts are slower than with `BAR` or `BAR_AMD`.
     amd_plain: bool,
     /// VK_EXT_conditional_rendering, unless STRATA_VK_NO_COND or its self-test failed: a MoE combine whose wait for
     /// the CPU worker gave up skips the rest of the submission (`skip_rest`), and the host finishes the forward.
@@ -279,8 +295,12 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     let p = p2.properties;
     if p.device_type == vk::PhysicalDeviceType::CPU { return Some("a CPU device".into()); }
     if p.api_version < vk::API_VERSION_1_3 { return Some("Vulkan 1.3 is needed".into()); }
-    if !(sg.min_subgroup_size..=sg.max_subgroup_size).contains(&32) || !sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE) {
-        return Some(format!("subgroup size 32 is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
+    // Pinning the size is needed only where it is selectable (NVIDIA, RDNA); GCN is wave64-only and its driver
+    // reports no requiredSubgroupSizeStages, so a fixed native WAVE is enough there.
+    let pin = sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE);
+    if !(sg.min_subgroup_size..=sg.max_subgroup_size).contains(&WAVE)
+        || (!pin && !(sg.min_subgroup_size == WAVE && sg.max_subgroup_size == WAVE)) {
+        return Some(format!("subgroup size {WAVE} is needed (it has {}-{})", sg.min_subgroup_size, sg.max_subgroup_size));
     }
     let ops = vk::SubgroupFeatureFlags::ARITHMETIC | vk::SubgroupFeatureFlags::SHUFFLE;
     if !p11.subgroup_supported_operations.contains(ops) || !p11.subgroup_supported_stages.contains(vk::ShaderStageFlags::COMPUTE) {
@@ -293,7 +313,10 @@ fn unusable(instance: &ash::Instance, pd: vk::PhysicalDevice) -> Option<String> 
     let missing: Vec<_> = [
         ("shaderInt16", int16), ("shaderInt64", int64), ("shaderFloat64", f64), ("storageBuffer16BitAccess", f11.storage_buffer16_bit_access),
         ("bufferDeviceAddress", f12.buffer_device_address), ("storageBuffer8BitAccess", f12.storage_buffer8_bit_access),
-        ("shaderInt8", f12.shader_int8), ("shaderFloat16", f12.shader_float16), ("vulkanMemoryModel", f12.vulkan_memory_model),
+        ("shaderInt8", f12.shader_int8),
+        // The wave64 kernels do every f16 conversion with integer ops (GCN has no f16): shaderFloat16 is not needed.
+        ("shaderFloat16", if cfg!(feature = "vk-wave64") { vk::TRUE } else { f12.shader_float16 }),
+        ("vulkanMemoryModel", f12.vulkan_memory_model),
         ("vulkanMemoryModelDeviceScope", f12.vulkan_memory_model_device_scope),
         ("subgroupSizeControl", f13.subgroup_size_control), ("computeFullSubgroups", f13.compute_full_subgroups),
         ("shaderIntegerDotProduct", f13.shader_integer_dot_product),
@@ -357,8 +380,9 @@ impl Vk {
         };
         if amd_coherent { exts.push(ash::amd::device_coherent_memory::NAME.as_ptr()) }
         let amd_plain = !amd_coherent && unsafe { instance.get_physical_device_properties(pd) }.vendor_id == 0x1002;
-        if amd_plain { eprintln!("warning: this AMD GPU has no VK_AMD_device_coherent_memory; experts on the CPU will make decode slow (the GPU \
-            does not see the CPU worker's answers in time)"); }
+        if amd_plain { eprintln!("warning: this AMD GPU has no VK_AMD_device_coherent_memory; it caches the mailbox \
+            writes of the host until a submission ends, so decode runs pipelined (one layer per submission, see \
+            Backend::expert_pipeline; STRATA_VK_NO_PIPE=1 disables that)"); }
         let mut fcr = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
         let cond = has(ash::ext::conditional_rendering::NAME) && std::env::var_os("STRATA_VK_NO_COND").is_none() && {
             unsafe { instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::default().push_next(&mut fcr)) };
@@ -372,7 +396,8 @@ impl Vk {
         let mut fcoop = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
         let mut f11 = vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(true);
         let mut f12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true)
-            .storage_buffer8_bit_access(true).timeline_semaphore(true).shader_int8(true).shader_float16(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
+            .storage_buffer8_bit_access(true).timeline_semaphore(true).shader_int8(true).vulkan_memory_model(true).vulkan_memory_model_device_scope(true);
+        if !cfg!(feature = "vk-wave64") { f12 = f12.shader_float16(true); }  // the wave64 kernels need no f16 (see unusable)
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().subgroup_size_control(true).compute_full_subgroups(true)
             .shader_integer_dot_product(true);
         let mut f = features(&mut f11, &mut f12, &mut f13);
@@ -408,14 +433,18 @@ impl Vk {
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
+        let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
+        unsafe { instance.get_physical_device_properties2(pd, &mut p2) };
+        let subgroup_pin = sg.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE);
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, subgroup_pin, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
         let staging = inner.buffer(STAGING, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
         st.staging = staging;
         st.map = map? as usize;
         // In mailbox memory: the GPU must see the host's give-up word (err[2]) at once, as it sees the worker's answers.
-        let (b, m) = inner.buffer(12, if inner.amd_coherent { BAR_AMD } else { BAR })?;
+        let (b, m) = inner.buffer(12, inner.mailbox_mem())?;
         let p = unsafe { inner.dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
         unsafe { (p as *mut [u32; 3]).write_volatile([0, 0, 0]) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
@@ -462,6 +491,12 @@ impl Vk {
 
 impl Inner {
     fn st(&self) -> MutexGuard<'_, State> { self.st.lock().unwrap_or_else(|e| e.into_inner()) }
+
+    /// Memory for the CPU expert mailbox: memory the GPU sees the moment the host writes it (`BAR` where the driver
+    /// keeps device memory coherent, `BAR_AMD` with AMD's coherent memory, `SYS` on GCN without it).
+    fn mailbox_mem(&self) -> &'static [vk::MemoryPropertyFlags] {
+        if self.amd_coherent { BAR_AMD } else if self.amd_plain { SYS } else { BAR }
+    }
 
     /// A buffer usable by kernels (device address) and copies, of at least `bytes`, in the first memory of `wants`
     /// (`DEVICE`, `HOST` or `BAR`) there is.
@@ -678,9 +713,10 @@ impl Inner {
             .chain([vk::SpecializationMapEntry::default().constant_id(15).offset(4 * n).size(4)]).collect();
         let data: Vec<u8> = spec.iter().chain([&(self.kv_q8 as u32)]).flat_map(|v| v.to_le_bytes()).collect();
         let si = vk::SpecializationInfo::default().map_entries(&entries).data(&data);
-        let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(32);
-        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
-            .specialization_info(&si).flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS).push_next(&mut sub);
+        let mut sub = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default().required_subgroup_size(WAVE);
+        let mut stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main")
+            .specialization_info(&si).flags(vk::PipelineShaderStageCreateFlags::REQUIRE_FULL_SUBGROUPS);
+        if self.subgroup_pin { stage = stage.push_next(&mut sub); }  // GCN runs its native wave64 unpinned (see unusable)
         let r = unsafe { self.dev.create_compute_pipelines(vk::PipelineCache::null(),
             &[vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.layout)
                 .flags(if self.stats { vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR } else { vk::PipelineCreateFlags::empty() })], None) };
@@ -974,6 +1010,9 @@ impl Backend for Vk {
     }
     fn beside_overlaps(&self) -> bool { self.0.tq.is_some() }
     fn stalled(&self) -> bool { std::mem::take(&mut self.0.st().stalled) }
+    /// GCN caches the GTT lines a combine spins on until the submission ends, so only a job boundary makes the host's
+    /// mailbox writes visible: pipeline the decode (one layer per submission) instead of waiting inside a kernel.
+    fn expert_pipeline(&self) -> bool { self.0.amd_plain && std::env::var_os("STRATA_VK_NO_PIPE").is_none() }
     /// With a transfer queue: the work so far is submitted, the copies of `f` go to the transfer queue after it, and
     /// `f`'s dispatches are submitted without waiting for them; the compute submit after the next `beside` waits for them.
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -1007,6 +1046,7 @@ impl Backend for Vk {
         Ok(())
     }
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
+        if self.expert_pipeline() { return f(); }  // a pipelined forward syncs per layer: one buffer to replay would defeat it
         let mut st = self.0.st();
         if let Some(&g) = st.graphs.get(&key) { return self.0.submit(&mut st, Some(g), false); }
         if std::env::var_os("STRATA_NO_GRAPH").is_some() { drop(st); return f(); }
@@ -1027,9 +1067,9 @@ impl Backend for Vk {
         self.0.submit(&mut st, Some(c), false)
     }
 
-    /// Device memory mapped through the BAR (`BAR`, or `BAR_AMD`).
+    /// Memory the host writes and kernels spin on (`Inner::mailbox_mem`).
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)> {
-        let (b, p) = self.buf(4 * words.max(1), if self.0.amd_coherent { BAR_AMD } else { BAR })?;
+        let (b, p) = self.buf(4 * words.max(1), self.0.mailbox_mem())?;
         Ok((b, p.cast()))
     }
     fn kv_words(&self, n: usize) -> usize { if self.0.kv_q8 { n * 17 / 32 } else { n } }

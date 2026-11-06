@@ -1,5 +1,5 @@
-// One subgroup routes one token: softmax over the n <= 32 * R logits at p[b ..] (lane holds i = lane + 32 r), top-k
-// (ties to the lower index), renormalized weights. Lane j < k gets the j-th expert's id and weight.
+// One logical warp of 32 routes one token: softmax over the n <= 32 * R logits at p[b ..] (lane holds i = lane + 32 r),
+// top-k (ties to the lower index), renormalized weights. Lane j < k gets the j-th expert's id and weight.
 const uint R = 16;
 void topk(F32 p, uint b, uint n, uint k, float extra_scale, uint lane, out int id, out float w) {
     float v[R];
@@ -20,8 +20,13 @@ void topk(F32 p, uint b, uint n, uint k, float extra_scale, uint lane, out int i
             uint i = lane + 32 * r, key = floatBitsToUint(v[r]) + 1;
             if (i < n && (taken >> r & 1) == 0 && key > bk) { bk = key; bi = i; }
         }
+#if SUBGROUP_SIZE == 32
         uint mk = subgroupMax(bk);
         bi = subgroupMin(bk == mk ? bi : 0xffffffffu);
+#else  // whole-wave collectives would mix the two logical warps; the butterflies give the same results per half
+        uint mk = warp_max_u(bk);
+        bi = warp_min_u(bk == mk ? bi : 0xffffffffu);
+#endif
         float bv = uintBitsToFloat(mk - 1);
         if ((bi & 31) == lane) taken |= 1u << (bi >> 5);
         if (lane == j) { id = int(bi); mine = bv; }

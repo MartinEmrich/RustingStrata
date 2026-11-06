@@ -14,7 +14,7 @@ void reduce(inout float b, inout int bi) {
     for (uint o = 16; o > 0; o >>= 1) take(b, bi, subgroupShuffleXor(b, o), subgroupShuffleXor(bi, o));
 }
 void main() {
-    uint t = gl_LocalInvocationID.x, lane = gl_SubgroupInvocationID, w = gl_SubgroupID;
+    uint t = gl_LocalInvocationID.x, lane = LANE, w = LW;
     uint r = FINAL ? gl_WorkGroupID.x : gl_WorkGroupID.y, xo = r * p.n;
     int n = int(p.n), bi = n;
     float b = uintBitsToFloat(0xff800000u);
@@ -29,7 +29,7 @@ void main() {
     reduce(b, bi);
     if (lane == 0) { sv[w] = b; si[w] = bi; }
     barrier();
-    if (w == 0) {
+    if (w == 0) {  // w = LW: at wave64 this is the first half of the wave, whose butterflies stay within it
         b = lane < 8 ? sv[lane] : uintBitsToFloat(0xff800000u); bi = lane < 8 ? si[lane] : n;
         reduce(b, bi);
         if (lane == 0) {

@@ -24,7 +24,18 @@ shared uint64_t s_g2[T == 22 ? 1024 : 1];
 uint u8_(U8 w, uint o) { return uint(w.v[o]); }
 uint ld16(U8 w, uint o) { return uint(U16(uint64_t(w)).v[o >> 1]); }  // 2-aligned only (every quant field is)
 uint ld32(U8 w, uint o) { return ld16(w, o) | ld16(w, o + 2) << 16; }
+#if F16
 float h2f(uint h) { return float(uint16BitsToFloat16(uint16_t(h))); }
+#else
+// The same exact half -> float without f16 arithmetic: normals rebias the exponent, subnormals are m * 2^-24 (exact
+// in f32), inf and nan pass through. uint16BitsToFloat16 would need the shaderFloat16 feature GCN lacks.
+float h2f(uint h) {
+    uint s = (h & 0x8000u) << 16, e = h >> 10 & 0x1fu, m = h & 0x3ffu;
+    if (e == 0u) return uintBitsToFloat(s | floatBitsToUint(float(m) * 5.960464477539063e-8));
+    if (e == 0x1fu) return uintBitsToFloat(s | 0x7f800000u | m << 13);
+    return uintBitsToFloat(s | ((h & 0x7fffu) << 13) + 0x38000000u);
+}
+#endif
 float ldh(U8 w, uint o) { return h2f(ld16(w, o)); }
 // Bytes of a row of `cols` values (a multiple of the type's block).
 uint rowb(uint cols) { return cols * SBB / 256; }

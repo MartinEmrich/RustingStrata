@@ -33,7 +33,11 @@ const uint BM = 128, BK = 64, PW = (BK + 8) / 2, XM = SM != 0 ? 32 : BM;  // sme
 #define CI(i) (2 * t + ((i) & 1) + 8 * (((i) >> 1) & 1))
 #endif
 shared uint xs[XM * PW], ws[64 * PW];
+#if F16
 uint h2(float a, float b) { return packFloat2x16(f16vec2(a, b)); }
+#else
+uint h2(float a, float b) { return packHalf2x16(vec2(a, b)); }  // same round-to-nearest-even f32 -> f16
+#endif
 shared float ix[512];  // the row and column index matrices
 
 // W step kb as halves: invocation decodes values 8 j .. 8 j + 7 of rows tid / 8 + 32 q (q < 2) into wv[4 q ..].
@@ -51,7 +55,7 @@ void stw(uint tid, uint wv[8]) {
 }
 
 void main() {
-    uint tid = gl_LocalInvocationID.x, w = gl_SubgroupID, n0 = gl_WorkGroupID.x * 64;
+    uint tid = gl_LocalInvocationID.x, w = LW, n0 = gl_WorkGroupID.x * 64;
     uint wm = (w >> 1) * 32, wn = (w & 1) * 32, m0, cnt;
     U8 wt;
     if (uint64_t(p.tiles) != 0) {
@@ -65,7 +69,7 @@ void main() {
 #endif
     for (uint i = tid; i < 256; i += 256) { ix[i] = float(i / 16); ix[256 + i] = float(i % 16); }
     load_tables();
-    uint g = gl_SubgroupInvocationID >> 2, t = gl_SubgroupInvocationID & 3;
+    uint g = LANE >> 2, t = LANE & 3;
     // sm (SM 1): the 2 x 4 output tiles of 16 x 16 go one per subgroup (rows tm, columns tn, in acc[0][0]) instead of
     // four each to subgroups 0 and 1. Each output sums the same products in the same order either way.
     const bool sm = SM != 0;
