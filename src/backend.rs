@@ -116,10 +116,6 @@ pub trait Backend: Send {
     /// L2): `GpuModel::forward` then pipelines one layer per submission, so every combine's answer is already in
     /// memory when its submission begins and no combine ever waits.
     fn expert_pipeline(&self) -> bool { false }
-    /// MoE layers per submission in `expert_pipeline` mode: the submission after the first runs the pre parts of
-    /// this many layers, so the CPU worker computes earlier requests while the GPU runs later ones and only the
-    /// round-trips (not every layer's worker time) are exposed.
-    fn pipe_batch(&self) -> usize { 1 }
     /// Upper bound on the prefill chunk in tokens, 0: none. GCN4 attention launches past ~2048 queries can wedge
     /// the ring or poison the results at deep positions (hang hunt in `attn_prefill_dp`), so the Vulkan backend
     /// asks the host to start smaller there; an explicit `--chunk` overrides.

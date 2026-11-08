@@ -1078,8 +1078,6 @@ impl Backend for Vk {
     /// GCN caches the GTT lines a combine spins on until the submission ends, so only a job boundary makes the host's
     /// mailbox writes visible: pipeline the decode (one layer per submission) instead of waiting inside a kernel.
     fn expert_pipeline(&self) -> bool { self.0.amd_plain && std::env::var_os("STRATA_VK_NO_PIPE").is_none() }
-    fn pipe_batch(&self) -> usize { if self.0.amd_plain { std::env::var("STRATA_VK_PIPE_BATCH").ok()
-        .and_then(|v| v.parse::<usize>().ok()).filter(|n| *n > 0).unwrap_or(8) } else { 1 } }
     fn prefill_chunk_cap(&self) -> usize { if self.0.coop || self.0.llama != 0 { 0 } else { 2048 } }
     fn prefill_cpu_moe_cap(&self) -> usize { if self.0.coop || self.0.llama != 0 { 0 } else { 24 } }
     /// GCN (vk-wave64) has no DP4A: the driver emulates the int8 dots and the f32-dequant gemv_f/moe_gemv_f win by a
