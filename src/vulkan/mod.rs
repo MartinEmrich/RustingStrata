@@ -564,6 +564,23 @@ impl Vk {
         eprintln!("submit probe: empty submit+wait avg {:.0} us (min {:.0}, max {:.0}) over {m:.0} warm",
             sum / m * 1e6, best * 1e6, worst * 1e6);
         unsafe { d.destroy_fence(f, None); d.free_command_buffers(st.pool, &[c]); }
+        // The real per-layer submission references host-visible memory (the mailbox and the CPU expert
+        // output). On a device without VK_AMD_device_coherent_memory radv must flush/invalidate the TC for
+        // those every submit; time a trivial dispatch reading each memory kind to price that flush.
+        let b = self as &dyn Backend;
+        let (hbuf, _) = self.buf(4096, HOST)?;
+        let (dbuf, out) = (b.zeros::<u8>(4096)?, b.zeros::<u32>(16)?);
+        for (kind, addr) in [("device", dbuf.addr()), ("host-visible", hbuf.addr())] {
+            let (mut s, mut lo) = (0f64, f64::MAX);
+            for i in 0..n {
+                let t0 = std::time::Instant::now();
+                self.run("gtt_probe", &[], [1, 1, 1], &[&addr, &out.addr(), &1u32])?;
+                self.sync()?;
+                let dt = t0.elapsed().as_secs_f64();
+                if i >= warm { s += dt; lo = lo.min(dt); }
+            }
+            eprintln!("submit probe: trivial dispatch on {kind} memory avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
+        }
         Ok(())
     }
 
