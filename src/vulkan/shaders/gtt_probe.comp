@@ -1,0 +1,13 @@
+#version 460
+layout(local_size_x = 256) in;
+#include "common.glsl"
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer U64 { uvec2 v[]; };
+layout(push_constant) uniform P { U64 x; MB o; uint n; } p;
+
+// STRATA_GTT_PROBE: sum `n` u64 words of `x` grid-strided into `o` - one full read of the buffer, so the same
+// dispatch over a VRAM and a host-visible buffer measures what kernels pay to read expert weights where they are.
+void main() {
+    uint s = 0, stride = gl_NumWorkGroups.x * 256u;
+    for (uint i = gl_GlobalInvocationID.x; i < p.n; i += stride) { uvec2 w = p.x.v[i]; s += w.x + w.y; }
+    if (s != 0) atomicAdd(p.o.v[0], s);
+}

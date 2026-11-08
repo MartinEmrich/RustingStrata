@@ -50,6 +50,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemmi_s", spv!("gemmi_s")),
     ("gemv_f", spv!("gemv_f")),
     ("gemv_q", spv!("gemv_q")),
+    ("gtt_probe", spv!("gtt_probe")),
     ("hc_mix", spv!("hc_mix")),
     ("hc_silu", spv!("hc_silu")),
     ("hc_write", spv!("hc_write")),
@@ -489,7 +490,29 @@ impl Vk {
         let amd = if v.0.amd_plain || v.0.amd_coherent { format!(", device-coherent memory {}", yn(v.0.amd_coherent)) } else { String::new() };
         eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}", s(&drv.driver_name),
             s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond));
+        if std::env::var_os("STRATA_GTT_PROBE").is_some() && let Err(e) = v.gtt_probe() { eprintln!("gtt probe: {e:#}"); }
         Ok(v)
+    }
+
+    /// STRATA_GTT_PROBE: what do kernels pay for reading host-visible memory (GTT) instead of VRAM? The same sum
+    /// kernel over 128 MB of each. Reading expert weights straight from RAM (instead of staging them) would cost
+    /// the host-visible number per expert read; a factor near 1 says the GPU page tables reach RAM at speed.
+    fn gtt_probe(&self) -> anyhow::Result<()> {
+        let (b, mb) = (self as &dyn Backend, 128usize << 20);
+        let (host, hp) = self.buf(mb, HOST)?;
+        unsafe { std::slice::from_raw_parts_mut(hp, mb).fill(0x5a) };
+        let (dev, out) = (b.zeros::<u8>(mb)?, b.zeros::<u32>(16)?);
+        let time = |addr: u64| -> anyhow::Result<f64> {
+            let t0 = std::time::Instant::now();
+            self.run("gtt_probe", &[], [1024, 1, 1], &[&addr, &out.addr(), &((mb / 8) as u32)])?;
+            self.kick()?;
+            b.get::<u32>(&out, 0, 1)?;
+            Ok(t0.elapsed().as_secs_f64())
+        };
+        let (th, td) = (time(host.addr())?, time(dev.addr())?);
+        eprintln!("gtt probe: read {mb} MB: VRAM {:.1} ms ({:.1} GB/s), host-visible {:.1} ms ({:.1} GB/s)",
+            td * 1e3, mb as f64 / td * 1e-9, th * 1e3, mb as f64 / th * 1e-9);
+        Ok(())
     }
 
     /// Whether conditional rendering skips dispatches after a nonzero error word and runs them after a zero one.
