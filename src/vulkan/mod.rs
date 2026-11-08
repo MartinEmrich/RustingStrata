@@ -128,6 +128,11 @@ const BAR_AMD: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(
 /// AMD GCN without VK_AMD_device_coherent_memory: the GPU caches its VRAM lines, the BAR aperture included, so the
 /// mailbox must be system memory (no DEVICE_LOCAL), which GCN reads without caching. Cached for the host's polling.
 const SYS: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xe), vk::MemoryPropertyFlags::from_raw(6)];
+/// `SYS` without `HOST_CACHED` (props 0x6): the host's writes reach memory at once instead of waiting for a cache
+/// eviction, so the GPU's `mb_wait` can see the worker's answer live and decode may skip pipelining. Host reads of it
+/// are write-combining (the worker already bulk-reads with `read_wc`); STRATA_MB_UNCACHED tests whether the cached bit
+/// is what forces the per-submission coherence flush.
+const MB_UNCACHED: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(6)];
 
 /// How long the host waits for a submission before it tells MoE combines still waiting for the CPU worker to give up
 /// (err[2], see `Inner::submit`).
@@ -558,7 +563,9 @@ impl Inner {
     /// Memory for the CPU expert mailbox: memory the GPU sees the moment the host writes it (`BAR` where the driver
     /// keeps device memory coherent, `BAR_AMD` with AMD's coherent memory, `SYS` on GCN without it).
     fn mailbox_mem(&self) -> &'static [vk::MemoryPropertyFlags] {
-        if self.amd_coherent { BAR_AMD } else if self.amd_plain { SYS } else { BAR }
+        if self.amd_coherent { BAR_AMD }
+        else if self.amd_plain { if std::env::var_os("STRATA_MB_UNCACHED").is_some() { MB_UNCACHED } else { SYS } }
+        else { BAR }
     }
 
     /// A buffer usable by kernels (device address) and copies, of at least `bytes`, in the first memory of `wants`
