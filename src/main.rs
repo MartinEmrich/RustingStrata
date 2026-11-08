@@ -656,6 +656,40 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     }
     if short == usize::MAX { short = 256; }
 
+    // The prefill CPU-expert boundary, for backends that want one (dp path). The isolated costs misjudge the
+    // crossover - staging overlaps with the GEMMs, small interleaved copies run slower than a lone big one, and
+    // the CPU pass serializes with the combine - so decide end-to-end: prefill one chunk of the calibration
+    // prompt at a few caps and keep the fastest. The isolated `expert_rows` and 16 MB copy numbers print as
+    // diagnostics.
+    let mut cpu_moe_cap = None;
+    if gm.gpu.prefill_cpu_moe_cap() > 0 {
+        let c = &m.cfg;
+        if let Some(il) = (0..c.n_layer).find(|&i| m.w.expert(i, "ffn_gate_exps.weight", 0, c.n_expert).is_ok()) {
+            let bytes = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter()
+                .map(|n| m.w.expert(il, n, 0, c.n_expert).map(|t| t.data.len())).sum::<anyhow::Result<usize>>()?;
+            let mut s = 0x9E3779B97F4A7C15u64;
+            let mut rnd = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s as f64 / u64::MAX as f64 - 0.5) as f32 };
+            let rows: Vec<Vec<f32>> = (0..32).map(|_| (0..c.n_embd).map(|_| rnd()).collect()).collect();
+            let xs: Vec<&[f32]> = rows.iter().map(|v| v.as_slice()).collect();
+            let mut out = vec![0f32; 32 * c.n_embd];
+            let ffn = best(&mut || { rusting_strata::cpu_moe::expert_rows(&m, il, 0, &xs, &mut out); Ok(()) })? / 32.0;
+            let (src, buf) = (vec![0u8; 16 << 20], gm.gpu.zeros::<u8>(16 << 20)?);
+            let copy = best(&mut || { gm.gpu.htod(&src, &buf, 0)?; gm.gpu.kick()?; gm.gpu.get::<u8>(&buf, 0, 1)?; Ok(()) })?;
+            eprintln!("cpu experts: FFN {:.2} ms/token, copy {:.0} MB/s, expert {bytes} B", ffn * 1e3, src.len() as f64 / copy * 1e-6);
+            let one = &pf[..pf.len().min(chunk.0)];
+            let mut win = (0usize, 0f64);
+            for cap in [0usize, 16, 32, 64] {
+                unsafe { std::env::set_var("STRATA_PF_CPU_MOE", cap.to_string()) };
+                let t = best(&mut || { gm.reset()?; gm.prefill(one).map(drop) })?;
+                let tps = one.len() as f64 / t;
+                eprintln!("cpu cap {cap:3}: prefill {} tok {tps:.0} tok/s", one.len());
+                if tps > win.1 { win = (cap, tps); }
+            }
+            eprintln!("cpu experts cap {}", win.0);
+            cpu_moe_cap = Some(win.0);
+        }
+    }
+
     let dec = tok.encode("Write a long story about a dragon.")?;
     let kmax = gm.k;
     let mut r = Runner::Gpu(Box::new(gm));
@@ -676,28 +710,6 @@ fn calibrate(model: &Path, ctx: usize, margin: usize, kind: Option<&str>, device
     }
 
     let Runner::Gpu(g) = &r else { unreachable!() };
-    // The prefill CPU-expert boundary, for backends that want one (dp path): the cap is the token count where an
-    // expert's FFN on the CPU costs as much as staging it costs in copies. Measure both sides: `expert_rows` on 32
-    // synthetic rows of a real expert, and a 16 MB host->VRAM copy on the staging path.
-    let mut cpu_moe_cap = None;
-    if g.gpu.prefill_cpu_moe_cap() > 0 {
-        let c = &m.cfg;
-        if let Some(il) = (0..c.n_layer).find(|&i| m.w.expert(i, "ffn_gate_exps.weight", 0, c.n_expert).is_ok()) {
-            let bytes = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].iter()
-                .map(|n| m.w.expert(il, n, 0, c.n_expert).map(|t| t.data.len())).sum::<anyhow::Result<usize>>()?;
-            let mut s = 0x9E3779B97F4A7C15u64;
-            let mut rnd = || { s ^= s << 13; s ^= s >> 7; s ^= s << 17; (s as f64 / u64::MAX as f64 - 0.5) as f32 };
-            let rows: Vec<Vec<f32>> = (0..32).map(|_| (0..c.n_embd).map(|_| rnd()).collect()).collect();
-            let xs: Vec<&[f32]> = rows.iter().map(|v| v.as_slice()).collect();
-            let mut out = vec![0f32; 32 * c.n_embd];
-            let ffn = best(&mut || { rusting_strata::cpu_moe::expert_rows(&m, il, 0, &xs, &mut out); Ok(()) })? / 32.0;
-            let (src, buf) = (vec![0u8; 16 << 20], g.gpu.zeros::<u8>(16 << 20)?);
-            let copy = best(&mut || { g.gpu.htod(&src, &buf, 0)?; g.gpu.kick()?; g.gpu.get::<u8>(&buf, 0, 1)?; Ok(()) })?;
-            let cap = ((bytes as f64 * copy / src.len() as f64) / ffn).clamp(0.0, 64.0).round() as usize;
-            eprintln!("cpu experts: FFN {:.2} ms/token, copy {:.0} MB/s, expert {bytes} B -> cap {cap}", ffn * 1e3, src.len() as f64 / copy * 1e-6);
-            cpu_moe_cap = Some(cap);
-        }
-    }
     let path = calibration_path(model, g.gpu.name());
     std::fs::create_dir_all(path.parent().unwrap())?;
     let mut v = json!({"chunk": chunk.0, "mtp": mtp.0, "short": short, "ctx": ctx,
