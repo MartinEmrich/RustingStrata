@@ -512,6 +512,18 @@ impl Vk {
         let (th, td) = (time(host.addr())?, time(dev.addr())?);
         eprintln!("gtt probe: read {mb} MB: VRAM {:.1} ms ({:.1} GB/s), host-visible {:.1} ms ({:.1} GB/s)",
             td * 1e3, mb as f64 / td * 1e-9, th * 1e3, mb as f64 / th * 1e-9);
+        // The mailbox question: is there a host-visible memory type the GPU does not cache (AMD flags 0x40/0x80)?
+        // With one, the CPU expert worker's answers could be polled live and decode would not need pipelining.
+        let mps = unsafe { self.0.instance.get_physical_device_memory_properties(self.0.pd) };
+        for i in 0..mps.memory_type_count {
+            let h = mps.memory_heaps[mps.memory_types[i as usize].heap_index as usize];
+            eprintln!("gtt probe: mem type {i}: heap {} (heap {:#x}) props {:#x}", mps.memory_types[i as usize].heap_index,
+                h.flags.as_raw(), mps.memory_types[i as usize].property_flags.as_raw());
+        }
+        match self.buf(4096, &[vk::MemoryPropertyFlags::from_raw(0xc0 | 6)]) {
+            Ok(_) => eprintln!("gtt probe: uncached host-visible memory allocatable (mailbox could be polled live)"),
+            Err(e) => eprintln!("gtt probe: no uncached host-visible memory: {e:#}"),
+        }
         Ok(())
     }
 
