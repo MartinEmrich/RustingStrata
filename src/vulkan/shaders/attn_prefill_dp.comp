@@ -1,41 +1,86 @@
 #version 460
 // Prefill attention without cooperative matrices: attn_prefill.glsl's inputs and output, but Q and the softmax weights
 // stay f32 (rounded to f16 as in attn_prefill, parity measured lower, #124), one subgroup per query, lane l holding dims
-// l + 32 j, and keys taken one at a time with an online softmax. Workgroup (x, h): queries 4x .. 4x + 3 of head h.
-layout(local_size_x = 128) in;
+// l + 32 j, and keys taken one at a time with an online softmax. Workgroup (x, h): queries 8x .. 8x + 7 of head h.
+// Keys stream in tiles of 8 through shared memory: the whole workgroup loads a tile, so the KV cache is read once per
+// 8 queries. (Every query re-reading it took over 4 s per dispatch at position 8192 with 4096-query chunks, which
+// tripped the amdgpu hangcheck and reset the GPU.) Workgroups stay at a fraction of a CU in every resource: 1024- and
+// 512-thread workgroups with 32 and 16 KB of shared memory saturated the register file or stalled the dispatch on gfx8
+// (a 512-thread / 16 KB launch wedged the ring at query position 8192; see the wave64 gfx8 hang hunt).
+layout(local_size_x = 256) in;
 #include "common.glsl"
-layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; } p;
+// `step` is the host's [pos, cap] pair and `q0` the first query's offset in the chunk (split launches share the
+// step buffer): the loop clamps to `cap` rows so garbled push constants (the gfx8 hang hunt) end the dispatch
+// instead of wedging it, and `dbg` (0: off) gets the arguments this launch actually received.
+layout(push_constant) uniform P { F32 q; U16 kc; U16 vc; F32 qg; F32 o; I32 step; uint t; uint nh; uint nkv; float scale; U32 qm; uint mw; uint q0; MB dbg; } p;
 layout(constant_id = 1) const uint PER = 4;  // head_dim / 32
-const uint HD = 32 * PER;
+const uint HD = 32 * PER, TILE = 8, HALF = TILE * HD / 2;  // TILE: queries per workgroup and keys per tile
+
+shared uint kv_tile[TILE * HD];  // TILE keys as packed f16 pairs, K first and then V
 
 void main() {
-    uint t = gl_WorkGroupID.x * 4 + LW, h = gl_WorkGroupID.y, lane = LANE;
-    if (t >= p.t) return;
-    uint kvo = h / (p.nh / p.nkv) * HD + lane, kvd = p.nkv * HD, last = uint(p.step.v[0]) + t;
+    uint t = gl_WorkGroupID.x * TILE + LW, h = gl_WorkGroupID.y, lane = LANE;
+    // The tile loop runs to the largest `last` of the workgroup (its trip count must be uniform for the barriers);
+    // a warp whose query is past the end computes a real row anyway and drops it at the store.
+    uint tq = min(t, p.t - 1u), step = uint(p.step.v[0]) + p.q0, cap = uint(p.step.v[1]);
+    uint kvo = h / (p.nh / p.nkv) * HD, kvd = p.nkv * HD, last = step + tq;
+    uint last_wg = step + min(gl_WorkGroupID.x * TILE + TILE - 1u, p.t - 1u);
+    if (cap > 0u) { last = min(last, cap - 1u); last_wg = min(last_wg, cap - 1u); }  // cap: KV rows allocated
+    bool rec = uint64_t(p.dbg) != 0u && gl_WorkGroupID.x == 0u && gl_WorkGroupID.y == 0u && gl_LocalInvocationID.x == 0u;
+    if (rec) {  // the arguments as they arrived: the host compares them with what it sent
+        p.dbg.v[0] = p.t; p.dbg.v[1] = p.nh; p.dbg.v[2] = p.nkv; p.dbg.v[3] = p.mw;
+        p.dbg.v[4] = uint(uint64_t(p.q)); p.dbg.v[5] = uint(uint64_t(p.q) >> 32);
+        p.dbg.v[6] = uint(uint64_t(p.kc)); p.dbg.v[7] = uint(uint64_t(p.kc) >> 32);
+        p.dbg.v[8] = uint(uint64_t(p.vc)); p.dbg.v[9] = uint(uint64_t(p.vc) >> 32);
+        p.dbg.v[10] = uint(uint64_t(p.o)); p.dbg.v[11] = uint(uint64_t(p.o) >> 32);
+        p.dbg.v[12] = uint(uint64_t(p.step)); p.dbg.v[13] = uint(uint64_t(p.step) >> 32);
+        p.dbg.v[14] = uint(uint64_t(p.qm)); p.dbg.v[15] = uint(uint64_t(p.qm) >> 32);
+        p.dbg.v[16] = step; p.dbg.v[17] = uint(p.step.v[1]);  // effective position (step.v[0] + q0) and cap
+        p.dbg.v[18] = 1u;  // started: the host polls this (mailbox memory) while the GPU hangs
+        p.dbg.v[19] = 0u;  // split launches run in order: every one clears the flag, so it means the last finished
+    }
     float q[PER], acc[PER], m = 0.0, l = 0.0;
     [[unroll]] for (uint j = 0; j < PER; j++) {
-        q[j] = p.q.v[(t * p.nh + h) * HD + lane + 32 * j] * p.scale;
+        q[j] = p.q.v[(tq * p.nh + h) * HD + lane + 32 * j] * p.scale;
         acc[j] = 0.0;
     }
     bool first = true;
-    for (uint k = 0; k <= last; k++) {
-        if (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, t, k)) continue;
-        float s = 0.0;
-        [[unroll]] for (uint j = 0; j < PER; j++) s += q[j] * ldkv(p.kc, k * kvd + kvo + 32 * j, HD);
+    for (uint kb = 0; kb <= last_wg; kb += TILE) {
+        barrier();
+        for (uint i = gl_LocalInvocationID.x; i < TILE * HD; i += gl_WorkGroupSize.x) {  // key row and dim pair, K then V
+            uint m2 = i / HALF, r = i % HALF, kk = r / (HD / 2), col = r % (HD / 2);
+            uint key = kb + kk;
+            kv_tile[i] = key > last_wg ? 0u : ldkv2p(m2 == 0u ? p.kc : p.vc, min(key, last_wg) * kvd + kvo + 2 * col, HD);
+        }
+        barrier();
+        for (uint kk = 0; kk < TILE; kk++) {
+            uint k = kb + kk;
+            if (k > last) break;
+            if (uint64_t(p.qm) != 0 && !qsa_bit(p.qm, p.mw, tq, k)) continue;
+            float s = 0.0;
+            [[unroll]] for (uint j = 0; j < PER; j++) {
+                vec2 kv = unpackHalf2x16(kv_tile[kk * (HD / 2) + 16 * j + (lane >> 1)]);
+                s += q[j] * (((lane & 1u) == 0u) ? kv.x : kv.y);
+            }
 #if SUBGROUP_SIZE == 32
-        s = subgroupAdd(s);
+            s = subgroupAdd(s);
 #else
-        s = warp_sum(s);  // whole-wave add would mix the two logical warps; the butterfly keeps the halves apart
+            s = warp_sum(s);  // whole-wave add would mix the two logical warps; the butterfly keeps the halves apart
 #endif
-        float mn = first ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
-        l = first ? e : fma(l, c, e);
-        first = false;
-        [[unroll]] for (uint j = 0; j < PER; j++) acc[j] = fma(e, ldkv(p.vc, k * kvd + kvo + 32 * j, HD), acc[j] * c);
-        m = mn;
+            float mn = first ? s : max(m, s), c = expf_(m - mn), e = expf_(s - mn);
+            l = first ? e : fma(l, c, e);
+            first = false;
+            [[unroll]] for (uint j = 0; j < PER; j++) {
+                vec2 kv = unpackHalf2x16(kv_tile[HALF + kk * (HD / 2) + 16 * j + (lane >> 1)]);
+                acc[j] = fma(e, (((lane & 1u) == 0u) ? kv.x : kv.y), acc[j] * c);
+            }
+            m = mn;
+        }
     }
     [[unroll]] for (uint j = 0; j < PER; j++) {
         uint col = lane + 32 * j;
-        float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[t * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
-        p.o.v[t * p.nh * HD + h * HD + col] = fdiv(acc[j], l) * gate;
+        float gate = uint64_t(p.qg) != 0 ? sigmoid(p.qg.v[tq * p.nh * 2 * HD + h * 2 * HD + HD + col]) : 1.0;
+        if (t < p.t) p.o.v[t * p.nh * HD + h * HD + col] = fdiv(acc[j], l) * gate;
     }
+    if (rec) p.dbg.v[19] = 1u;  // finished: the workgroup that records is done, the dispatch ends with the rest
 }

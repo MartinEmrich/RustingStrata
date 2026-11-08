@@ -175,6 +175,8 @@ struct Inner {
     kv_q8: bool,
     /// STRATA_VK_STATS: print the driver's statistics (registers, ...) of each pipeline as it is created.
     stats: bool,
+    /// STRATA_TRACE: print every dispatch (sequence, kernel, grid, specialization) as it is recorded.
+    trace: bool,
     /// The one pipeline layout: a 128-byte push constant range (the Vulkan minimum), no descriptor sets.
     layout: vk::PipelineLayout,
     st: Mutex<State>,
@@ -248,6 +250,9 @@ struct State {
     /// waits before it), names in order, and per-name totals (ns, calls)
     /// printed on drop.
     prof: Option<(vk::QueryPool, Vec<&'static str>, HashMap<&'static str, (u64, usize)>)>,
+    /// The `attn_prefill_dp` debug record (gfx8 hang hunt), in mailbox memory so the host can read it while the GPU
+    /// is stuck: the arguments the kernel received (0..18), then started and finished flags, see `attn_args_dbg`.
+    attn_dbg: (vk::Buffer, vk::DeviceMemory, usize, u64),
 }
 
 /// Owner of one `Buf`: the buffer and its memory, freed on drop.
@@ -389,7 +394,10 @@ impl Vk {
             writes of the host until a submission ends, so decode runs pipelined (one layer per submission, see \
             Backend::expert_pipeline; STRATA_VK_NO_PIPE=1 disables that)"); }
         let mut fcr = vk::PhysicalDeviceConditionalRenderingFeaturesEXT::default();
-        let cond = has(ash::ext::conditional_rendering::NAME) && std::env::var_os("STRATA_VK_NO_COND").is_none() && {
+        // Not on `amd_plain`: the predicate sits in system memory (the mailbox type) and the CP's read of it wedges
+        // the PCIe path on GCN (hang dumps show the predicate COPY_DATA stuck with TA/BIF busy), while the pipelined
+        // decode there never lets a combine spin long enough to need the skip.
+        let cond = has(ash::ext::conditional_rendering::NAME) && std::env::var_os("STRATA_VK_NO_COND").is_none() && !amd_plain && {
             unsafe { instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::default().push_next(&mut fcr)) };
             fcr.conditional_rendering == vk::TRUE
         };
@@ -436,7 +444,8 @@ impl Vk {
         let st = State { pool, spare: vec![], used: vec![], cur: None, cond: None, no_cond: false, stalled: false, busy: false, gpool, graphs: HashMap::new(), rec: None, batch: false, beside: false, tpool, tcur: None,
             tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
-            prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None } };
+            prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None },
+            attn_dbg: Default::default() };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
         let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut sg);
@@ -445,7 +454,7 @@ impl Vk {
         let mb = |v: &str| std::env::var(v).ok().and_then(|x| x.parse::<usize>().ok()).map(|m| m << 20).filter(|b| *b >= 1 << 20);
         let ring = mb("STRATA_VK_RING_MB").filter(|b| *b <= 1 << 30).unwrap_or(STAGING);
         let submit_b = mb("STRATA_VK_SUBMIT_MB").filter(|b| *b <= ring / 2).unwrap_or(SUBMIT_BYTES.min(ring / 2));
-        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], ring, submit_b, csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, subgroup_pin, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, layout, st: Mutex::new(st) };
+        let inner = Inner { _entry: entry, instance, pd, dev, queue, tq, qfs: [qf, tf.unwrap_or(qf)], ring, submit_b, csem, tsem, mem, budget, coop, coop_i8, amd_coherent, amd_plain, subgroup_pin, cr, llama: crate::cuda::llama_numerics() as u32, kv_q8: crate::cuda::kv_q8(), stats, trace: std::env::var_os("STRATA_TRACE").is_some(), layout, st: Mutex::new(st) };
         let staging = inner.buffer(ring, HOST)?;
         let map = unsafe { inner.dev.map_memory(staging.1, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) };
         let mut st = inner.st();
@@ -456,6 +465,11 @@ impl Vk {
         let p = unsafe { inner.dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
         unsafe { (p as *mut [u32; 3]).write_volatile([0, 0, 0]) };
         st.err = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
+        // The attention debug record: same mailbox memory, so its writes reach the host even when the ring hangs.
+        let (b, m) = inner.buffer(80, inner.mailbox_mem())?;
+        let p = unsafe { inner.dev.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }?;
+        unsafe { (p as *mut [u32; 20]).write_volatile([0; 20]) };
+        st.attn_dbg = (b, m, p as usize, unsafe { inner.dev.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b)) });
         drop(st);
         let mut v = Vk(Arc::new(inner), Buf::new(0, 0, ()), Buf::new(0, 0, ()), Mutex::new((Buf::new(0, 0, ()), None)));
         v.1 = v.buf(XQ, DEVICE)?.0;
@@ -777,6 +791,11 @@ impl Vk {
         let mut st = self.0.st();
         let p = self.0.pipeline(&mut st, name, spec)?;
         let cb = self.0.cb(&mut st)?;
+        if self.0.trace {
+            use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            eprintln!("disp {} {name} {}x{}x{} spec {spec:?}", SEQ.fetch_add(1, Relaxed), groups[0], groups[1], groups[2]);
+        }
         let d = &self.0.dev;
         unsafe {
             d.cmd_bind_pipeline(cb, vk::PipelineBindPoint::COMPUTE, p);
@@ -1024,6 +1043,7 @@ impl Backend for Vk {
     /// GCN caches the GTT lines a combine spins on until the submission ends, so only a job boundary makes the host's
     /// mailbox writes visible: pipeline the decode (one layer per submission) instead of waiting inside a kernel.
     fn expert_pipeline(&self) -> bool { self.0.amd_plain && std::env::var_os("STRATA_VK_NO_PIPE").is_none() }
+    fn prefill_chunk_cap(&self) -> usize { if self.0.coop || self.0.llama != 0 { 0 } else { 2048 } }
     /// GCN (vk-wave64) has no DP4A: the driver emulates the int8 dots and the f32-dequant gemv_f/moe_gemv_f win by a
     /// wide margin (as gemm_f_dp does for the GEMM) — int8 products only when STRATA_MMQ asks for them.
     fn gemv_dequant(&self, ty: GgmlType) -> bool {
@@ -1201,9 +1221,51 @@ impl Backend for Vk {
             return self.run("attn_prefill_llama", &[0, hd as u32], [t, nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
         }
         if !self.0.coop {
-            return self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [t.div_ceil(4), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)]);
+            let dbg = self.0.st().attn_dbg.3;
+            // GCN4 hang hunt: with chunk 4096 the first attention at position 8192 wedges the ring (every time
+            // under syncshaders, sometimes in plain mode, where it can also just produce NaN), chunk 2048 never
+            // does. Splitting the big attention into 2048-query launches does NOT dodge it (the dumps show the
+            // sub-launches reach the CP with correct arguments), so the trigger is the chunk context, not the
+            // launch shape: the host caps the chunk (Backend::prefill_chunk_cap) and this split stays as an
+            // experiment knob (STRATA_ATTN_SPLIT).
+            let split = std::env::var("STRATA_ATTN_SPLIT").ok().and_then(|v| v.parse::<usize>().ok())
+                .filter(|s| *s >= 64).unwrap_or(2048).min(t).max(32) & !31;  // multiple of 32: qm rows are bits
+            let mut at = 0;
+            while at < t {
+                let n = split.min(t - at);
+                self.run("attn_prefill_dp", &[0, (hd / 32) as u32], [n.div_ceil(8), nh, 1],
+                    &[&(q + (at * nh * hd * 4) as u64), &kc, &vc, &(qg + (at * nh * 2 * hd * 4) as u64),
+                      &(out + (at * nh * hd * 4) as u64), &step, &(n as u32), &(nh as u32), &(nkv as u32),
+                      &scale, &(qm + (at * mw * 4) as u64), &(mw as u32), &(at as u32), &dbg])?;
+                at += n;
+            }
+            return Ok(());
         }
         self.run(name, &[], [t.div_ceil(64), nh, 1], &[&q, &kc, &vc, &qg, &out, &step, &(t as u32), &(nh as u32), &(nkv as u32), &scale, &qm, &(mw as u32)])
+    }
+    fn attn_args_dbg(&self) -> anyhow::Result<Vec<u32>> {
+        if self.0.coop || self.0.llama != 0 { return Ok(Vec::new()); }  // those paths do not record
+        let p = self.0.st().attn_dbg.2;
+        anyhow::ensure!(p != 0, "no attention debug record");
+        Ok((0..20).map(|i| unsafe { std::ptr::read_volatile((p as *const u32).add(i)) }).collect())
+    }
+    fn attn_dbg_reset(&self) {
+        if self.0.coop || self.0.llama != 0 { return; }
+        let p = self.0.st().attn_dbg.2;
+        if p != 0 { unsafe { (p as *mut [u32; 20]).write_volatile([0; 20]) } };
+    }
+    fn attn_dbg_poll(&self, secs: u64) -> Vec<u32> {
+        if self.0.coop || self.0.llama != 0 { return Vec::new(); }
+        let p = self.0.st().attn_dbg.2;
+        if p == 0 { return Vec::new(); }
+        let read = |v: &mut [u32; 20]| for (i, x) in v.iter_mut().enumerate() { *x = unsafe { std::ptr::read_volatile((p as *const u32).add(i)) } };
+        let mut v = [0u32; 20];
+        let t0 = std::time::Instant::now();
+        loop {
+            read(&mut v);
+            if v[19] == 1 || t0.elapsed().as_secs() >= secs { return v.to_vec(); }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     fn moe_combine_seq(&self, x: u64, ye: u64, wts: u64, inv: u64, k: usize, sh: u64, sg: u64, n: usize, t: usize) -> anyhow::Result<()> {
         self.run("moe_combine_seq", &[], [(t * n).div_ceil(256), 1, 1], &[&x, &ye, &wts, &inv, &sh, &sg, &(k as u32), &(n as u32), &(t as u32)])

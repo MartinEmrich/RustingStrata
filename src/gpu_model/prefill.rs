@@ -181,10 +181,28 @@ impl GpuModel<'_> {
         let c = &self.m.cfg;
         let pf = self.pf.as_ref().unwrap();
         let (g, mut t, n, eps, ne) = (&self.gpu, toks.len(), pf.chunk, c.eps, c.n_embd);
+        // STRATA_STEP_DEBUG: read the device step back at the chunk start, at the top of every attention layer, after
+        // the QSA block and after the draft head's write. A corrupted step makes attn_prefill loop over billions of
+        // tiles (a GPU hang) and a corrupted ids buffer trips the router guard below: say which buffer broke, and where.
+        let stepdbg = std::env::var_os("STRATA_STEP_DEBUG").is_some();
+        if std::env::var_os("STRATA_TRACE").is_some() { eprintln!("chunk pos {} t {t}", self.pos); }
+        anyhow::ensure!(self.pos + t <= self.ctx, "prefill chunk: pos {} + {t} tokens past ctx {}", self.pos, self.ctx);
+        let pos0 = self.pos;
+        let step_ok = |what: &str, il: usize, off: usize, want: i32| -> anyhow::Result<()> {
+            if !stepdbg { return Ok(()); }
+            let s: i32 = g.get(&self.step_buf, off, 1)?[0];
+            if s != want {
+                anyhow::bail!("step_buf {what}: layer {il} step[{off}] = {s:#010x}, expected {want:#010x} (pos {pos0})");
+            }
+            Ok(())
+        };
         let d = c.hc_n.max(1) * ne;
         g.put(emb, &pf.slab, 0)?;
         if !pe.is_empty() { g.put(pe, &pf.slab, pf.lay.emb)?; }
-        g.put(&[self.pos as i32, 0], &self.step_buf, 0)?;
+        // Word 1 is the KV capacity: `attn_prefill_dp` clamps its key loop to it (gfx8 hang hunt). The decode
+        // kernels read word 1 as the mailbox sequence but never run this kernel, and 0 means "no clamp".
+        g.put(&[self.pos as i32, self.ctx as i32], &self.step_buf, 0)?;
+        step_ok("chunk", 0, 0, self.pos as i32)?;
         let mut step = self.step_buf.addr();
         let base = pf.slab.addr();
         let at = |o: usize| base + 4 * o as u64;
@@ -217,6 +235,8 @@ impl GpuModel<'_> {
             if let Some(i) = v.iter().position(|a| !a.is_finite()) { tr.push_str(&format!(" (non-finite row {})", i / w)); }
             Ok(())
         };
+        // What the last `attn_prefill_m` call sent (t, nh, nkv, mw, pos), checked against what the kernel recorded.
+        let mut want_attn: Option<(u32, u32, u32, u32, u32)> = None;
         for (il, ly) in self.layers.iter().enumerate().map(|(i, ly)| (self.first + i, ly)).chain(mtp.map(|mh| (c.n_layer, &mh.layer))) {
             if let Some(mh) = mtp.filter(|_| il == c.n_layer) {
                 // Its entry for token i pairs the token with the hidden state before it (`mtp_run`): h gets the last
@@ -231,7 +251,9 @@ impl GpuModel<'_> {
                 g.rms_norm(x, ne, mh.enorm.ptr, at(l.a), 2 * ne, ne, t, eps)?;
                 g.rms_norm(h, ne, mh.hnorm.ptr, at(l.a + ne), 2 * ne, ne, t, eps)?;
                 g.gemm_dense(&mh.eh_proj, t, at(l.a), 2 * ne, x, ne, 0)?;
-                g.put(&[mh.pos as i32, 0], &self.step_buf, 2)?;
+                g.put(&[mh.pos as i32, self.ctx as i32], &self.step_buf, 2)?;
+                anyhow::ensure!(mh.pos + t <= self.ctx, "mtp attn: head pos {} + {t} tokens past ctx {}", mh.pos, self.ctx);
+                step_ok("head", il, 2, mh.pos as i32)?;
                 step += 8;
             }
             if let Some(pl) = &ly.ple { self.ple(pl, x, step, t, &ha)?; }
@@ -268,6 +290,7 @@ impl GpuModel<'_> {
                     g.gemm_dense(out, t, at(l.d), c.ssm_d_inner, mx, ne, mact)?;
                 }
                 Mixer::Attn { q, k, v, qn, kn, o, kc, vc, qsa } => {
+                    step_ok("attn", il, 0, self.pos as i32)?;
                     let (kraw, kk, vv) = (at(l.c), at(l.c + n * kv), at(l.c + 2 * n * kv));
                     let qs = if c.q_gate { 2 * hd } else { hd };
                     g.gemm_dense(q, t, h, ne, at(l.a), nh * qs, 0)?;
@@ -299,7 +322,25 @@ impl GpuModel<'_> {
                         }
                         _ => (0, 0),
                     };
+                    step_ok("qsa", il, if il == c.n_layer { 2 } else { 0 }, if il == c.n_layer { self.mtp.as_ref().unwrap().pos as i32 } else { self.pos as i32 })?;
+                    let apos = if il == c.n_layer { self.mtp.as_ref().unwrap().pos } else { self.pos };
+                    if std::env::var_os("STRATA_TRACE").is_some() {
+                        eprintln!("attn layer {il} t {t} pos {apos} nh {nh} hd {hd} nkv {nkv} qm {qm:#x} mw {mw}");
+                    }
                     g.attn_prefill_m(at(l.b), kc.addr(), vc.addr(), if c.q_gate { at(l.a) } else { 0 }, at(l.d), step, t, nh, nkv, hd, 1.0 / (hd as f32).sqrt(), qm, mw)?;
+                    want_attn = Some((t as u32, nh as u32, nkv as u32, mw as u32, apos as u32));
+                    if std::env::var_os("STRATA_TRACE").is_some() {
+                        // Submit now and watch the kernel's mailbox record: a launch that never started and one that
+                        // started but never finished are different bugs, and both look like a hang from the outside.
+                        g.attn_dbg_reset();
+                        g.kick()?;
+                        let rec = g.attn_dbg_poll(8);
+                        if !rec.is_empty() {
+                            eprintln!("attn watchdog: {}", if rec[0] == 0 { "NEVER STARTED".to_string() }
+                                else if rec[19] != 1 { format!("STARTED, NEVER FINISHED: {rec:?}") }
+                                else { "ok".to_string() });
+                        }
+                    }
                     probe(&mut tr, "q", &pf.slab, at(l.a), nh * qs, t)?;
                     probe(&mut tr, "k", &pf.slab, kk, kv, t)?;
                     probe(&mut tr, "v", &pf.slab, vv, kv, t)?;
@@ -345,6 +386,27 @@ impl GpuModel<'_> {
                     probe(&mut tr, "weights", &pf.slab, at(l.wts), k, t)?;
                     let s0 = Instant::now();
                     let ids = g.get::<i32>(&pf.ints, 0, t * k)?;
+                    // The attention of this very layer ran before this readback: compare what its kernel recorded
+                    // having received with what was sent (empty on backends without the debug buffer). Split
+                    // launches record the effective position of the last one, so the position is a range check.
+                    if let Some(w) = want_attn.take() {
+                        let rec = g.attn_args_dbg()?;
+                        anyhow::ensure!(rec.is_empty() || (rec[0] <= w.0 && rec[1] == w.1 && rec[2] == w.2 && rec[3] == w.3
+                            && rec[16] >= w.4 && rec[16] < w.4 + w.0),
+                            "attn args: the kernel saw t {} nh {} nkv {} mw {} step {} (q {:#x}, kc {:#x}, vc {:#x}, o {:#x}, step {:#x}, qm {:#x}, cap {}), the host sent t {} nh {} nkv {} mw {} step {}",
+                            rec[0], rec[1], rec[2], rec[3], rec[16],
+                            rec[4] as u64 | (rec[5] as u64) << 32, rec[6] as u64 | (rec[7] as u64) << 32, rec[8] as u64 | (rec[9] as u64) << 32,
+                            rec[10] as u64 | (rec[11] as u64) << 32, rec[12] as u64 | (rec[13] as u64) << 32, rec[14] as u64 | (rec[15] as u64) << 32,
+                            rec[17], w.0, w.1, w.2, w.3, w.4);
+                    }
+                    // topk.glsl emits ids in 0 .. n_expert (or -1); anything else is another kernel smashing the
+                    // ids buffer with its own data: say where and what, not the bounds panic the sort would raise.
+                    if let Some(i) = ids.iter().position(|&e| e < 0 || e as usize >= c.n_expert) {
+                        let bad = ids.iter().filter(|&&e| e < 0 || e as usize >= c.n_expert).count();
+                        let xr = g.get::<i32>(&pf.ints, n * k, t * k)?;
+                        let ids2 = g.get::<i32>(&pf.ints, 0, t * k)?;
+                        anyhow::bail!("router ids: layer {il} at pos {} with {t} tokens: {bad} of {} out of range, first {:#010x} at {i}, ids {} the xrow region, re-read {}", self.pos, ids.len(), ids[i] as u32, if xr == ids { "are" } else { "differ from" }, if ids2 == ids { "matches" } else { "DIFFERS" });
+                    }
                     let s1 = Instant::now();
                     let cache = self.cache.as_mut().unwrap();
                     cache.record(il, &ids);
@@ -361,6 +423,13 @@ impl GpuModel<'_> {
                     }
                     g.put(&xrow, &pf.ints, n * k)?;
                     g.put(&inv, &pf.ints, 2 * n * k)?;
+                    if stepdbg {  // the puts above must not touch the ids region: read both window starts back
+                        let chk: Vec<i32> = g.get(&pf.ints, 0, 16)?;
+                        if chk[..] != ids[..16] {
+                            let xr: Vec<i32> = g.get(&pf.ints, n * k, 16)?;
+                            anyhow::bail!("ids overwritten at layer {il} pos {}: ids window {chk:?}, xrow window {xr:?}", self.pos);
+                        }
+                    }
                     let s2 = Instant::now();
                     let lx = cache.layer(il).unwrap();
                     let (pool, stride) = cache.base(lx);

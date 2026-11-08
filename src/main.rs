@@ -157,7 +157,14 @@ impl Engine {
         let v: serde_json::Value = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         if !v.is_null() { eprintln!("calibration: {}", path.display()); }
         let get = |k: &str| v[k].as_u64().map(|x| x as usize);
-        self.chunk.get_or_insert(get("chunk").unwrap_or(4096));
+        // Backends with a prefill chunk cap (GCN4 attention launches) start below it; an explicit --chunk wins.
+        let cap = bk.as_ref().map_or(0, |b| b.iter().map(|g| g.prefill_chunk_cap()).filter(|c| *c > 0).min().unwrap_or(0));
+        let want = get("chunk").unwrap_or(4096);
+        match self.chunk {
+            Some(n) if cap > 0 && n > cap => eprintln!("warning: this GPU needs chunks of {cap} or less (GCN4 attention hang), running with --chunk {n} as asked"),
+            None => self.chunk = Some(want.min(if cap > 0 { cap } else { usize::MAX })),
+            _ => {}
+        }
         self.mtp.get_or_insert(get("mtp").unwrap_or(0));
         self.short = get("short").unwrap_or(32);
         // The global pool can be built once; a model loaded later by `serve` keeps the first one's threads.

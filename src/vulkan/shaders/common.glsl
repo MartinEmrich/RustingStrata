@@ -164,6 +164,11 @@ uint ldkv2(U16 c, uint off, uint hd) {
     float d = unpackHalf2x16(uint(c.v[(r + hd) / 2 + w / 32])).x;
     return packHalf2x16(vec2(rh(float(int(b << 24) >> 24) * d), rh(float(int(b << 16) >> 24) * d)));
 }
+// Cache values off and off + 1 (off even) as one f16 pair word, either cache kind: the f16 cache holds the bits.
+uint ldkv2p(U16 c, uint off, uint hd) {
+    if (!KV_Q8) return uint(c.v[off]) | uint(c.v[off + 1]) << 16;
+    return ldkv2(c, off, hd);
+}
 // q8 values off .. off + 3 (off % 4 == 0) as two f16 pair words, from one 4-byte load and one scale. Rows start
 // 4-byte aligned only when hd % 64 == 0 (hd * 17 / 16 bytes each); otherwise two ldkv2.
 uvec2 ldkv4(U16 c, uint off, uint hd) {

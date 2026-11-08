@@ -116,6 +116,10 @@ pub trait Backend: Send {
     /// L2): `GpuModel::forward` then pipelines one layer per submission, so every combine's answer is already in
     /// memory when its submission begins and no combine ever waits.
     fn expert_pipeline(&self) -> bool { false }
+    /// Upper bound on the prefill chunk in tokens, 0: none. GCN4 attention launches past ~2048 queries can wedge
+    /// the ring or poison the results at deep positions (hang hunt in `attn_prefill_dp`), so the Vulkan backend
+    /// asks the host to start smaller there; an explicit `--chunk` overrides.
+    fn prefill_chunk_cap(&self) -> usize { 0 }
     /// Whether `gemvq`, `moe_gemv` and their fused kin dequantize `ty` weights in the shader and multiply in f32
     /// instead of quantizing the activations and taking int8 products (which GCN has to emulate). True also asks
     /// `swiglu` to leave the expert activations in f32 for the down GEMV.
@@ -232,6 +236,17 @@ pub trait Backend: Send {
     /// `attn_prefill` where query row i sees only the keys whose 4-cell block has its bit set in row i of `qm` (`mw`
     /// words a row, rows up to `t` rounded up to 64; see `qsa_select`). `qm` 0: no mask.
     fn attn_prefill_m(&self, q: u64, kc: u64, vc: u64, qg: u64, out: u64, step: u64, t: usize, nh: usize, nkv: usize, hd: usize, scale: f32, qm: u64, mw: usize) -> anyhow::Result<()>;
+    /// The debug record of `attn_prefill_dp` (gfx8 hang hunt): what the last prefill attention launch received -
+    /// `t`, `nh`, `nkv`, `mw`, then the `q`, `kc`, `vc`, `o`, `step`, `qm` pointers (low and high word), then the
+    /// effective position (`step.v[0] + q0`) and cap, then the started and finished flags. Empty where the backend
+    /// does not record.
+    fn attn_args_dbg(&self) -> anyhow::Result<Vec<u32>> { Ok(Vec::new()) }
+    /// Zero the record, for `attn_dbg_poll`.
+    fn attn_dbg_reset(&self) {}
+    /// Submit the recorded work without waiting and watch the record for up to `secs`: the kernel sets the started
+    /// flag before its key loop and the finished flag after its stores, so a timeout tells a hung launch apart
+    /// from a launch that never started. The record, whatever it holds.
+    fn attn_dbg_poll(&self, secs: u64) -> Vec<u32> { let _ = secs; Vec::new() }
     /// QSA indexer keys (see `Model::qsa`): pool the blocks of 4 positions that the `t` raw keys (rows of 128) at
     /// positions step[0] .. complete into `pool` (rows of 128 per block: mean, rms norm with `w`, NEOX rope at the
     /// block's first position). `ring`: 4 rows of 128, the raw keys of the incomplete block (row = position % 4).
