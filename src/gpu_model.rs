@@ -685,12 +685,15 @@ impl<'a> GpuModel<'a> {
             }
         }
         if prof {
+            use std::sync::atomic::Ordering::Relaxed;
+            use crate::vulkan as vk;
             PIPE_PROF.with(|pr| {
                 let (a, b, d, n) = pr.get();
                 let (a, b, d) = (a + t_enq, b + t_sync, d + t_wait);
                 if n + 1 == 64 {
-                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms, worker wait {} ms",
-                        a as f64 / 1e6, b as f64 / 1e6, d as f64 / 1e6);
+                    let (sub, fen, cln) = (vk::PIPE_SUB.swap(0, Relaxed), vk::PIPE_FEN.swap(0, Relaxed), vk::PIPE_CLN.swap(0, Relaxed));
+                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms (submit {} fence {} cleanup {}), worker wait {} ms",
+                        a as f64 / 1e6, b as f64 / 1e6, sub as f64 / 1e6, fen as f64 / 1e6, cln as f64 / 1e6, d as f64 / 1e6);
                     pr.set((0, 0, 0, 0));
                 } else { pr.set((a, b, d, n + 1)); }
             });

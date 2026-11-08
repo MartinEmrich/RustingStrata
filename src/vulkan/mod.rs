@@ -133,6 +133,12 @@ const SYS: &[vk::MemoryPropertyFlags] = &[vk::MemoryPropertyFlags::from_raw(0xe)
 /// (err[2], see `Inner::submit`).
 const GIVE_UP: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// STRATA_PIPE_PROF: the blocking submit split into the `queue_submit` ioctl, the fence wait and the cleanup
+/// after it (pool and fence resets); read and reset by the pipelined forward's report.
+pub(crate) static PIPE_SUB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PIPE_FEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static PIPE_CLN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Bytes of the quantized-x scratch buffer.
 const XQ: usize = 4 << 20;
 
@@ -657,10 +663,15 @@ impl Inner {
         let mut tl = vk::TimelineSemaphoreSubmitInfo::default().wait_semaphore_values(&wv[..n]).signal_semaphore_values(&sv);
         let si = vk::SubmitInfo::default().command_buffers(&cbs).wait_semaphores(&ws[..n]).wait_dst_stage_mask(&wst[..n])
             .signal_semaphores(&ss).push_next(&mut tl);
+        // STRATA_PIPE_PROF: split the blocking submit into ioctl, fence wait and cleanup.
+        let prof = std::env::var_os("STRATA_PIPE_PROF").is_some();
+        let t0 = std::time::Instant::now();
         unsafe { self.dev.queue_submit(self.queue, &[si], fence) }?;
+        if prof { PIPE_SUB.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
         st.twait = 0;
         st.busy = true;
         if wait {
+            let t1 = std::time::Instant::now();
             // A fence also covers every earlier submission on the queue; the transfer queue's copies are waited too.
             // A MoE combine waiting for the CPU worker gives up after SPINS polls, but a poll can be slow enough (RADV)
             // for that to outlast the driver's job timeout (amdgpu: 10 s, then the device is lost). So after GIVE_UP
@@ -675,6 +686,8 @@ impl Inner {
                     r => break r?,
                 }
             }
+            if prof { PIPE_FEN.fetch_add(t1.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
+            let t2 = std::time::Instant::now();
             if !e.is_null() { unsafe { e.add(2).write_volatile(0) } }
             unsafe {
                 self.dev.reset_fences(&[st.fence])?;
@@ -708,6 +721,7 @@ impl Inner {
                 anyhow::bail!("moe_combine: the CPU expert worker did not answer in time, and without Vulkan conditional \
                     rendering the forward cannot resume");
             }
+            if prof { PIPE_CLN.fetch_add(t2.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed); }
         }
         Ok(())
     }
