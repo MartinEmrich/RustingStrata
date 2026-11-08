@@ -502,6 +502,7 @@ impl Vk {
         eprintln!("vulkan: {name} ({} {}){amd}, cooperative matrix f16 {} int8 {}, conditional rendering {}", s(&drv.driver_name),
             s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond));
         if std::env::var_os("STRATA_GTT_PROBE").is_some() && let Err(e) = v.gtt_probe() { eprintln!("gtt probe: {e:#}"); }
+        if std::env::var_os("STRATA_SUBMIT_PROBE").is_some() && let Err(e) = v.submit_probe() { eprintln!("submit probe: {e:#}"); }
         Ok(v)
     }
 
@@ -535,6 +536,34 @@ impl Vk {
             Ok(_) => eprintln!("gtt probe: uncached host-visible memory allocatable (mailbox could be polled live)"),
             Err(e) => eprintln!("gtt probe: no uncached host-visible memory: {e:#}"),
         }
+        Ok(())
+    }
+
+    /// STRATA_SUBMIT_PROBE: the floor of one submit+wait on this driver, with an empty command buffer - the
+    /// CSN ioctl, BO validation and fence round-trip alone, no kernels. The pipelined decode pays one submit
+    /// per MoE layer; if this is milliseconds, that cost is the driver's and only fewer submissions dodge it.
+    fn submit_probe(&self) -> anyhow::Result<()> {
+        let d = &self.0.dev;
+        let st = self.0.st();
+        let c = unsafe { d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default()
+            .command_pool(st.pool).command_buffer_count(1)) }?[0];
+        let f = unsafe { d.create_fence(&vk::FenceCreateInfo::default(), None) }?;
+        unsafe { d.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()) }?;
+        unsafe { d.end_command_buffer(c) }?;
+        let (n, warm) = (300usize, 20usize);
+        let (mut sum, mut best, mut worst) = (0f64, f64::MAX, 0f64);
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            unsafe { d.queue_submit(self.0.queue, &[vk::SubmitInfo::default().command_buffers(&[c])], f) }?;
+            while unsafe { d.wait_for_fences(&[f], true, 1_000_000_000) } == Err(vk::Result::TIMEOUT) {}
+            let dt = t0.elapsed().as_secs_f64();
+            unsafe { d.reset_fences(&[f])?; d.reset_command_buffer(c, vk::CommandBufferResetFlags::empty())?; }
+            if i >= warm { sum += dt; best = best.min(dt); worst = worst.max(dt); }
+        }
+        let m = (n - warm) as f64;
+        eprintln!("submit probe: empty submit+wait avg {:.0} us (min {:.0}, max {:.0}) over {m:.0} warm",
+            sum / m * 1e6, best * 1e6, worst * 1e6);
+        unsafe { d.destroy_fence(f, None); d.free_command_buffers(st.pool, &[c]); }
         Ok(())
     }
 
