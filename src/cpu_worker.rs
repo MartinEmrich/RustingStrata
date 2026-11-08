@@ -7,9 +7,28 @@
 use crate::model::Model;
 use crate::backend::{Backend, Buf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock};
+use std::sync::mpsc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// STRATA_PIPE_PROF: cross-thread timestamps (ns since a process-wide epoch) splitting the pipelined decode
+/// worker wait into submit->REQ (the GPU running `moe_route`) and REQ->DONE (the worker reading and computing).
+/// The host stores the submit time, the worker adds the REQ and DONE deltas; the forward prints the averages.
+pub(crate) static PIPE_SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_REQ_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_DONE_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_CNT: AtomicU64 = AtomicU64::new(0);
+static PIPE_EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// Nanoseconds since a process-wide epoch, comparable across the host and worker threads.
+pub fn pipe_now() -> u64 { PIPE_EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64 }
+
+/// Whether the pipelined decode probe is on (read once).
+fn pipe_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("STRATA_PIPE_PROF").is_some())
+}
 
 /// Word offsets inside one layer's mailbox. Flags sit on separate cache lines.
 pub const REQ: usize = 0;
@@ -92,6 +111,9 @@ impl CpuWorker {
                         std::hint::spin_loop();
                     }
                     if r != seq { continue; }
+                    if pipe_on() {
+                        PIPE_REQ_NS.fetch_add(pipe_now().saturating_sub(PIPE_SUBMIT_NS.load(Ordering::Relaxed)), Ordering::Relaxed);
+                    }
                     // mfence: loads of write-combining memory (the Vulkan BAR mailbox) are weakly ordered, so an
                     // acquire fence (no instruction on x86) would not keep them after the REQ load.
                     fence(Ordering::SeqCst);
@@ -142,6 +164,11 @@ impl CpuWorker {
                     fence(Ordering::SeqCst);
                     unsafe { at(DONE).write_volatile(seq) };
                     fence(Ordering::SeqCst);
+                    if pipe_on() {
+                        let d = pipe_now().saturating_sub(PIPE_SUBMIT_NS.load(Ordering::Relaxed));
+                        PIPE_DONE_NS.fetch_add(d, Ordering::Relaxed);
+                        PIPE_CNT.fetch_add(1, Ordering::Relaxed);
+                    }
                     bn.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }
             }

@@ -2,7 +2,7 @@
 //! rest run on the CPU (`cpu_moe`) while the GPU computes hits and the shared expert. Mirrors `model.rs`.
 
 use crate::config::LayerKind;
-use crate::cpu_worker::{CpuWorker, TMAX};
+use crate::cpu_worker::{self, CpuWorker, TMAX};
 use crate::backend::{ATT_GQA_MIN, ATT_SPLITS, Backend, Buf, GpuTensor};
 use crate::expert_cache::ExpertCache;
 use crate::model::Model;
@@ -677,9 +677,9 @@ impl<'a> GpuModel<'a> {
                 t_enq += t0.elapsed().as_nanos();
                 let t1 = std::time::Instant::now();
                 // End the submission that raised this layer's request without waiting for it: the worker's
-                // answer below proves the GPU ran it, and the combine's in-kernel wait paces the queue. A
-                // fence wait here would idle the GPU once per layer, and Polaris wake-up latency per fence
-                // is milliseconds - the whole decode cost.
+                // answer below proves the GPU ran it, and the combine's in-kernel wait paces the queue. The
+                // submission boundary is where the host and GPU make the mailbox coherent (see the probe).
+                if prof { cpu_worker::PIPE_SUBMIT_NS.store(cpu_worker::pipe_now(), std::sync::atomic::Ordering::Relaxed); }
                 g.submit_nowait()?;
                 t_sync += t1.elapsed().as_nanos();
                 let t2 = std::time::Instant::now();
@@ -696,8 +696,11 @@ impl<'a> GpuModel<'a> {
                 let (a, b, d) = (a + t_enq, b + t_sync, d + t_wait);
                 if n + 1 == 64 {
                     let (sub, fen, cln) = (vk::PIPE_SUB.swap(0, Relaxed), vk::PIPE_FEN.swap(0, Relaxed), vk::PIPE_CLN.swap(0, Relaxed));
-                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms (submit {} fence {} cleanup {}), worker wait {} ms",
-                        a as f64 / 1e6, b as f64 / 1e6, sub as f64 / 1e6, fen as f64 / 1e6, cln as f64 / 1e6, d as f64 / 1e6);
+                    let cnt = cpu_worker::PIPE_CNT.swap(0, Relaxed).max(1);
+                    let (req, done) = (cpu_worker::PIPE_REQ_NS.swap(0, Relaxed) / cnt, cpu_worker::PIPE_DONE_NS.swap(0, Relaxed) / cnt);
+                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms (submit {} fence {} cleanup {}), worker wait {} ms | per layer submit->REQ {:.0} us, REQ->DONE {:.0} us",
+                        a as f64 / 1e6, b as f64 / 1e6, sub as f64 / 1e6, fen as f64 / 1e6, cln as f64 / 1e6, d as f64 / 1e6,
+                        req as f64 / 1e3, done as f64 / 1e3);
                     pr.set((0, 0, 0, 0));
                 } else { pr.set((a, b, d, n + 1)); }
             });
