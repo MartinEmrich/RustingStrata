@@ -647,31 +647,44 @@ impl<'a> GpuModel<'a> {
     }
 
     /// The forward for backends whose GPU only sees the host's mailbox writes when the submission that raised the
-    /// request ends (`Backend::expert_pipeline`): each submission ends at an MoE layer, the host waits for that
-    /// layer's answer, and the next submission starts with that layer's combine, whose wait then always succeeds.
-    /// One submission per layer costs a little; a combine that gives up costs about half a second.
+    /// request ends (`Backend::expert_pipeline`): each submission ends at an MoE layer, the host waits for those
+    /// layers' answers, and the next submission starts with their combines, whose waits then always succeed. Each
+    /// submission carries the pre parts of `Backend::pipe_batch` MoE layers: the worker answers the first request
+    /// while the GPU runs the later layers of the same submission, so only the round-trips and the worker's tail
+    /// are exposed. A combine that gives up costs about half a second.
     fn forward_pipelined(&self, nt: usize, gq: i32, from: Option<usize>) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
         let p = |n: &str| self.bufs[n].addr();
         let x = self.x.addr();
         let w = self.worker.as_ref().unwrap();
-        let mut res = 0;
-        let mut pending = from;  // MoE layer whose combine is owed: its part ran before the submission that stalled
-        for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il + 1 - self.first)) {
-            let il = self.first + i;
-            if let Some(pl) = pending.take() {
-                self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?;
-                res = 0;
+        let batch = self.gpu.pipe_batch().max(1);
+        let mut res;
+        // MoE layers whose combine is owed: their pre parts ran in the submission before the last sync.
+        let mut owed: Vec<usize> = from.into_iter().collect();
+        let mut i = from.map_or(0, |il| il + 1 - self.first);
+        loop {
+            for &pl in &owed { self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?; }
+            owed.clear();
+            res = 0;
+            while i < self.layers.len() {
+                let il = self.first + i;
+                let moe = matches!(self.layers[i].ffn, Ffn::Moe { .. });
+                res = self.layer(il, &self.layers[i], x, step, Some(w), nt, res, gq, Phase::Pre)?;
+                i += 1;
+                if moe { owed.push(il); if owed.len() == batch { break; } }
             }
-            res = self.layer(il, l, x, step, Some(w), nt, res, gq, Phase::Pre)?;
-            if matches!(l.ffn, Ffn::Moe { .. }) {
-                g.sync()?;  // the submission that raised this layer's request ends here
-                w.wait_done(il)?;
-                pending = Some(il);
+            let end = i == self.layers.len();
+            if owed.is_empty() { break; }  // only trailing dense layers ran: no request was raised
+            g.sync()?;  // the submission that raised the requests of `owed` ends here
+            for &il in &owed { w.wait_done(il)?; }
+            if end {
+                for &pl in &owed { self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?; }
+                owed.clear();
+                break;
             }
         }
-        if let Some(pl) = pending.take() { self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?; }
+        debug_assert!(owed.is_empty());
         if self.next.is_some() { return if res != 0 { g.add(x, res, nt * ne) } else { Ok(()) }; }
         match (&self.output_norm, &self.output_hc) {
             (Some(on), _) => g.rms_norm_q(x, ne, on.ptr, p("h"), ne, ne, nt, eps, p("hq"), res)?,
