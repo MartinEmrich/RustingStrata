@@ -13,6 +13,11 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
+thread_local! {
+    /// STRATA_PIPE_PROF: (enqueue, sync, worker-wait) nanoseconds and forwards for `forward_pipelined`.
+    static PIPE_PROF: std::cell::Cell<(u128, u128, u128, u32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
 /// tokens fall on one side of ATT_GQA_MIN, i32::MAX (one head per block) or 0 (GQA) gives the same result and lets the
 /// backend launch only the kernel that works.
@@ -656,20 +661,39 @@ impl<'a> GpuModel<'a> {
         let p = |n: &str| self.bufs[n].addr();
         let x = self.x.addr();
         let w = self.worker.as_ref().unwrap();
+        let prof = std::env::var_os("STRATA_PIPE_PROF").is_some();
+        let (mut t_enq, mut t_sync, mut t_wait) = (0u128, 0u128, 0u128);
         let mut res = 0;
         let mut pending = from;  // MoE layer whose combine is owed: its part ran before the submission that stalled
         for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il + 1 - self.first)) {
             let il = self.first + i;
+            let t0 = std::time::Instant::now();
             if let Some(pl) = pending.take() {
                 self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?;
                 res = 0;
             }
             res = self.layer(il, l, x, step, Some(w), nt, res, gq, Phase::Pre)?;
             if matches!(l.ffn, Ffn::Moe { .. }) {
+                t_enq += t0.elapsed().as_nanos();
+                let t1 = std::time::Instant::now();
                 g.sync()?;  // the submission that raised this layer's request ends here
+                t_sync += t1.elapsed().as_nanos();
+                let t2 = std::time::Instant::now();
                 w.wait_done(il)?;
+                t_wait += t2.elapsed().as_nanos();
                 pending = Some(il);
             }
+        }
+        if prof {
+            PIPE_PROF.with(|pr| {
+                let (a, b, d, n) = pr.get();
+                let (a, b, d) = (a + t_enq, b + t_sync, d + t_wait);
+                if n + 1 == 64 {
+                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms, worker wait {} ms",
+                        a as f64 / 1e6, b as f64 / 1e6, d as f64 / 1e6);
+                    pr.set((0, 0, 0, 0));
+                } else { pr.set((a, b, d, n + 1)); }
+            });
         }
         if let Some(pl) = pending.take() { self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?; }
         if self.next.is_some() { return if res != 0 { g.add(x, res, nt * ne) } else { Ok(()) }; }
