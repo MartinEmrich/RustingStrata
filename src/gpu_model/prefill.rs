@@ -91,7 +91,7 @@ impl GpuModel<'_> {
         }
         let s = self.tail();
         let (g, ne) = (&s.gpu, s.m.cfg.n_embd);
-        let h = s.bufs["h"].addr();
+        let h = s.bufs["h"];
         // `prefill_chunk` leaves the last hidden state in row 0 of `x`, as after `step` (the MTP draft reads it).
         match (&s.output_norm, &s.output_hc) {
             (Some(on), _) => g.rms_norm(s.x.addr(), 0, on.ptr, h, 0, ne, 1, s.m.cfg.eps)?,

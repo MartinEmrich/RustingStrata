@@ -122,8 +122,15 @@ pub struct GpuModel<'a> {
     qsa: Option<QsaBufs>,
     ple_prev: [i64; 2],
     saved_ple_prev: [i64; 2],
-    /// Scratch activations by name.
-    bufs: HashMap<&'static str, Buf>,
+    /// Scratch activations by name, as device addresses into `scratch` (one buffer, so a layer submission references
+    /// one buffer instead of dozens; the driver's per-submission cost scales with the buffers a job touches).
+    bufs: HashMap<&'static str, u64>,
+    /// Owns the arena the `bufs` addresses point into; never read, only dropped (it frees the arena).
+    #[allow(dead_code)]
+    scratch: Buf,
+    /// The embedding staging buffer, kept separate because it is copied to and from the host (`emb` is read back
+    /// after a forward and written on a split model's hand-off); every other scratch buffer is only a device address.
+    emb: Option<Buf>,
     x: Buf,
     worker: Option<CpuWorker>,
     logits: Buf,
@@ -314,9 +321,21 @@ impl<'a> GpuModel<'a> {
         if c.hc_n > 0 {
             let d = c.hc_n * c.n_embd;
             sizes.extend([("xn", d), ("lo", c.hc_rank), ("hg", d), ("inj", c.hc_n), ("mo", c.n_embd),
-                          ("pk", d), ("pq", d), ("pg", d), ("pn", d), ("pv", c.n_embd), ("emb", c.n_embd)]);
+                          ("pk", d), ("pq", d), ("pg", d), ("pn", d), ("pv", c.n_embd)]);
         }
-        let bufs = sizes.into_iter().map(|(name, n)| Ok((name, gpu.zeros::<f32>(TMAX * n)?))).collect::<anyhow::Result<HashMap<_, _>>>()?;
+        // One arena for all the named scratch activations: a layer submission then references a single buffer for
+        // them instead of dozens, and the driver's per-submission cost (which scales with the buffers a job touches)
+        // drops. Each region is 256-byte aligned, the device-address alignment the kernels already rely on. The
+        // embedding buffer is the one exception: it is copied to and from the host, so it stays a real buffer.
+        let (mut off, mut base) = (HashMap::new(), 0usize);
+        for (name, n) in sizes {
+            off.insert(name, base as u64);
+            base += (TMAX * n * 4).next_multiple_of(256);
+        }
+        let scratch = gpu.zeros::<u8>(base)?;
+        let sbase = scratch.addr();
+        let bufs = off.into_iter().map(|(name, o)| (name, sbase + o)).collect::<HashMap<_, _>>();
+        let emb = if c.hc_n > 0 { Some(gpu.zeros::<f32>(TMAX * c.n_embd)?) } else { None };
         let (x, logits, ids) = (gpu.zeros::<f32>(TMAX * hcn * c.n_embd)?, gpu.zeros::<f32>(TMAX * c.n_vocab)?, gpu.zeros::<i32>(TMAX * ke)?);
         let amax = gpu.zeros::<i32>(TMAX)?;
         let (slots, step_buf) = (gpu.zeros::<i32>(TMAX * ke)?, gpu.zeros::<i32>(2 * TMAX)?);
@@ -360,7 +379,7 @@ impl<'a> GpuModel<'a> {
             }),
             None => None,
         };
-        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
+        Ok(GpuModel { m, gpu, layers, output_norm, output_hc, output, ple_ring, qsa, ple_prev: [-1, -1], saved_ple_prev: [-1, -1], bufs, scratch, emb, x, worker, logits, amax, ids, slots, step_buf, ctx, pos: 0, saved: vec![], saved_pos: 0, saved_ids: vec![], sys: None, parked: vec![], cache_ram: 0, cache, adapt_every: 8, hits: 0, misses: 0, cpu_time: Duration::ZERO, resumed: Default::default(), drafts: (0, 0), split_time: Default::default(), k, short: 32, pf, mtp, first: range.start, next: None })
     }
 
     /// Clear KV and recurrent state (and forget the `prefill_cached` prefix, whose KV this zeroes).
@@ -397,10 +416,10 @@ impl<'a> GpuModel<'a> {
         self.finish(nt, gq_min(self.pos, nt), None)?;
         let c = &self.m.cfg;
         let xs = self.gpu.get::<f32>(&self.x, 0, nt * c.hc_n.max(1) * c.n_embd)?;
-        let pe = match self.bufs.get("emb") { Some(e) => self.gpu.get::<f32>(e, 0, nt * c.n_embd)?, None => vec![] };
+        let pe = match self.emb.as_ref() { Some(e) => self.gpu.get::<f32>(e, 0, nt * c.n_embd)?, None => vec![] };
         let nx = self.next.as_deref_mut().unwrap();
         nx.gpu.put(&xs, &nx.x, 0)?;
-        if !pe.is_empty() { nx.gpu.put(&pe, &nx.bufs["emb"], 0)?; }
+        if !pe.is_empty() && let Some(e) = nx.emb.as_ref() { nx.gpu.put(&pe, e, 0)?; }
         let seq = nx.worker.as_mut().map_or(0, |w| w.begin());
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(nx.pos + t) as i32, seq as i32]).collect();
         nx.gpu.put(&steps, &nx.step_buf, 0)?;
@@ -416,7 +435,7 @@ impl<'a> GpuModel<'a> {
         self.gpu.put(&emb, &self.x, 0)?;
         if self.ple_ring.is_some() {
             let pe: Vec<f32> = tokens.iter().flat_map(|&t| self.m.ple_embed(&mut self.ple_prev, t)).collect();
-            self.gpu.put(&pe, &self.bufs["emb"], 0)?;
+            self.gpu.put(&pe, self.emb.as_ref().unwrap(), 0)?;
         }
         Ok(())
     }
@@ -634,7 +653,7 @@ impl<'a> GpuModel<'a> {
         if self.gpu.expert_pipeline() && self.worker.is_some() { return self.forward_pipelined(nt, gq, from); }
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
-        let p = |n: &str| self.bufs[n].addr();
+        let p = |n: &str| self.bufs[n];
         let x = self.x.addr();
         let mut res = 0;
         for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il - self.first)) {
@@ -658,7 +677,7 @@ impl<'a> GpuModel<'a> {
     fn forward_pipelined(&self, nt: usize, gq: i32, from: Option<usize>) -> anyhow::Result<()> {
         let c = &self.m.cfg;
         let (g, eps, ne, step) = (&self.gpu, c.eps, c.n_embd, self.step_buf.addr());
-        let p = |n: &str| self.bufs[n].addr();
+        let p = |n: &str| self.bufs[n];
         let x = self.x.addr();
         let w = self.worker.as_ref().unwrap();
         let prof = std::env::var_os("STRATA_PIPE_PROF").is_some();
@@ -722,7 +741,7 @@ impl<'a> GpuModel<'a> {
     }
 
     fn hc_at(&self) -> HcAt {
-        let p = |n: &str| self.bufs.get(n).map_or(0, |b| b.addr());
+        let p = |n: &str| self.bufs.get(n).map_or(0, |a| *a);
         HcAt { xn: p("xn"), lo: p("lo"), hg: p("hg"), inj: p("inj"), h: p("h"), hq: p("hq"), emb: p("emb"), pk: p("pk"), pq: p("pq"), pg: p("pg"), pn: p("pn"), pv: p("pv"), gemm: false }
     }
 
@@ -885,7 +904,7 @@ impl<'a> GpuModel<'a> {
     /// combine, one after) when the GPU only sees the host's mailbox writes at submission boundaries.
     fn mtp_forward(&self, hid: u64, nt: usize, head: bool, gq: i32, resume: bool) -> anyhow::Result<()> {
         let (c, g, h) = (&self.m.cfg, &self.gpu, self.mtp.as_ref().unwrap());
-        let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"].addr());
+        let (eps, ne, hp) = (c.eps, c.n_embd, self.bufs["h"]);
         let (eh, x) = (h.eh.addr(), h.x.addr());
         let pipe = !resume && matches!(h.layer.ffn, Ffn::Moe { .. }) && g.expert_pipeline();
         if !resume {
@@ -919,7 +938,7 @@ impl<'a> GpuModel<'a> {
     fn layer(&self, il: usize, l: &Layer, x: u64, step: u64, worker: Option<&CpuWorker>, nt: usize, res: u64, gq: i32, phase: Phase) -> anyhow::Result<u64> {
         let c = &self.m.cfg;
         let (g, eps, ne) = (&self.gpu, c.eps, c.n_embd);
-        let p = |n: &str| self.bufs[n].addr();
+        let p = |n: &str| self.bufs[n];
         // Inputs from "h" are quantized once ("hq", after each norm) instead of once per GEMV block.
         let mv = |w: &GpuTensor, x: &str, xs: usize, y: &str, ys: usize|
             if x == "h" { g.gemvq(w, p(x), xs, p("hq"), p(y), ys, nt) } else { self.mv(w, p(x), xs, p(y), ys, nt) };
