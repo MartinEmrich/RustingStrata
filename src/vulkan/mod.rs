@@ -1076,6 +1076,11 @@ impl Backend for Vk {
     }
 
     fn sync(&self) -> anyhow::Result<()> { self.0.flush(&mut self.0.st()) }
+    fn submit_nowait(&self) -> anyhow::Result<()> {
+        let mut st = self.0.st();
+        self.0.tsubmit(&mut st)?;
+        self.0.submit(&mut st, None, false)
+    }
 
     /// A reusable command buffer per key, submitted without waiting. `STRATA_NO_GRAPH` runs `f` every time instead.
     fn batch(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {

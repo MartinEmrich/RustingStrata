@@ -91,6 +91,11 @@ pub trait Backend: Send {
     fn mem_info(&self) -> anyhow::Result<(usize, usize)>;
     /// Wait for all queued device work.
     fn sync(&self) -> anyhow::Result<()>;
+    /// Queue all submitted work without waiting for it: the next op on the queue runs after it. The pipelined
+    /// decode forward uses this per layer - the worker's answer it then waits for proves the GPU reached the
+    /// layer, and the combines' in-kernel waits pace the queue - because a fence wait per layer costs the GPU
+    /// wake-up latency of the idle gap it creates (`Backend::expert_pipeline`).
+    fn submit_nowait(&self) -> anyhow::Result<()> { self.sync() }
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;

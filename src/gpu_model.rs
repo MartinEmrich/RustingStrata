@@ -676,7 +676,11 @@ impl<'a> GpuModel<'a> {
             if matches!(l.ffn, Ffn::Moe { .. }) {
                 t_enq += t0.elapsed().as_nanos();
                 let t1 = std::time::Instant::now();
-                g.sync()?;  // the submission that raised this layer's request ends here
+                // End the submission that raised this layer's request without waiting for it: the worker's
+                // answer below proves the GPU ran it, and the combine's in-kernel wait paces the queue. A
+                // fence wait here would idle the GPU once per layer, and Polaris wake-up latency per fence
+                // is milliseconds - the whole decode cost.
+                g.submit_nowait()?;
                 t_sync += t1.elapsed().as_nanos();
                 let t2 = std::time::Instant::now();
                 w.wait_done(il)?;
@@ -888,7 +892,7 @@ impl<'a> GpuModel<'a> {
         }
         if pipe {
             self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, Phase::Pre)?;
-            g.sync()?;  // the submission that raised the request ends here: only now can the worker's answer be seen
+            g.submit_nowait()?;  // the request is queued; the answer below proves the GPU ran it
             h.worker.wait_done(c.n_layer)?;
             self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, Phase::Comb)?;
         } else {
