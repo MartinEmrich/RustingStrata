@@ -25,7 +25,7 @@ static PIPE_EPOCH: OnceLock<Instant> = OnceLock::new();
 pub fn pipe_now() -> u64 { PIPE_EPOCH.get_or_init(Instant::now).elapsed().as_nanos() as u64 }
 
 /// Whether the pipelined decode probe is on (read once).
-fn pipe_on() -> bool {
+pub(crate) fn pipe_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("STRATA_PIPE_PROF").is_some())
 }

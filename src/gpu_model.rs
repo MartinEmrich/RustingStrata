@@ -895,6 +895,7 @@ impl<'a> GpuModel<'a> {
         }
         if pipe {
             self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, Phase::Pre)?;
+            if cpu_worker::pipe_on() { cpu_worker::PIPE_SUBMIT_NS.store(cpu_worker::pipe_now(), std::sync::atomic::Ordering::Relaxed); }
             g.submit_nowait()?;  // the request is queued; the answer below proves the GPU ran it
             h.worker.wait_done(c.n_layer)?;
             self.layer(c.n_layer, &h.layer, x, h.step_buf.addr(), Some(&h.worker), nt, 0, gq, Phase::Comb)?;
