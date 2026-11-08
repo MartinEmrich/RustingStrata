@@ -1024,6 +1024,12 @@ impl Backend for Vk {
     /// GCN caches the GTT lines a combine spins on until the submission ends, so only a job boundary makes the host's
     /// mailbox writes visible: pipeline the decode (one layer per submission) instead of waiting inside a kernel.
     fn expert_pipeline(&self) -> bool { self.0.amd_plain && std::env::var_os("STRATA_VK_NO_PIPE").is_none() }
+    /// GCN (vk-wave64) has no DP4A: the driver emulates the int8 dots and the f32-dequant gemv_f/moe_gemv_f win by a
+    /// wide margin (as gemm_f_dp does for the GEMM) — int8 products only when STRATA_MMQ asks for them.
+    fn gemv_dequant(&self, ty: GgmlType) -> bool {
+        cfg!(feature = "vk-wave64") && !matches!(ty, GgmlType::F32 | GgmlType::BF16)
+            && !std::env::var("STRATA_MMQ").is_ok_and(|v| v.split(',').any(|t| t == ty.name()))
+    }
     /// With a transfer queue: the work so far is submitted, the copies of `f` go to the transfer queue after it, and
     /// `f`'s dispatches are submitted without waiting for them; the compute submit after the next `beside` waits for them.
     fn beside(&self, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()> {
@@ -1098,7 +1104,7 @@ impl Backend for Vk {
     fn gemvq(&self, w: &GpuTensor, x: u64, x_stride: usize, xq: u64, y: u64, y_stride: usize, nt: usize) -> anyhow::Result<()> {
         ensure!((1..=4).contains(&nt), "gemvn: {nt} inputs (1 to 4)");
         let (nc, spec) = (gemv_cols(self.0.llama, w.ty, w.cols)?, [&self.wspec(w.ty)[..], &[nt as u32]].concat());
-        if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) {
+        if matches!(w.ty, GgmlType::F32 | GgmlType::BF16) || self.gemv_dequant(w.ty) {
             // Rows per workgroup as CUDA gemv_cfg: 8 for tall matrices, else 1 (hc_attn_up 10240 x 320).
             let wpb = if w.rows >= 4096 { 8 } else { 1 };
             let spec = [&spec[..], &[32 * wpb as u32]].concat();
@@ -1116,7 +1122,7 @@ impl Backend for Vk {
         let (nc, spec, ntok) = (gemv_cols(self.0.llama, ty, cols)?, self.wspec(ty), k / xg);
         let (w2, y2) = pair.unwrap_or((0, 0));
         let z = if pair.is_some() { 2 } else { 1 };
-        if matches!(ty, GgmlType::F32 | GgmlType::BF16) {
+        if matches!(ty, GgmlType::F32 | GgmlType::BF16) || self.gemv_dequant(ty) {
             return self.run("moe_gemv_f", &spec, [rows, k, z], &[&w, &ids, &x, &y, &(stride as u64), &(w2 as u64), &(y2 as u64),
                 &(x_stride as u32), &(rows as u32), &nc, &(xg as u32)]);
         }
@@ -1266,7 +1272,7 @@ impl Backend for Vk {
     }
     fn moe_down_combine(&self, ty: GgmlType, rows: usize, cols: usize, w: u64, stride: usize, slots: u64, k: usize, h: u64, ye: u64, xq: u64,
                         x: u64, wh: u64, sh: u64, sg: u64, mb: u64, y_off: usize, step: u64, t: usize) -> anyhow::Result<()> {
-        if xq == 0 || cols % 256 != 0 || k > 32 {  // the shader keeps up to 32 slots in shared memory
+        if xq == 0 || self.gemv_dequant(ty) || cols % 256 != 0 || k > 32 {  // the shader keeps up to 32 slots in shared memory
             self.moe_gemv(ty, rows, cols, w, stride, slots, t * k, h, cols, 1, ye, None, xq)?;
             return self.moe_combine(x, ye, wh, k, sh, sg, mb, y_off, step, slots, rows, t);
         }

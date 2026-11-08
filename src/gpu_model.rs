@@ -891,7 +891,7 @@ impl<'a> GpuModel<'a> {
         let mv2 = |a: &GpuTensor, b: &GpuTensor, ya: &str, yb: &str| g.gemvq2(a, b, p("h"), ne, p("hq"), p(ya), p(yb), nt);
         // The SwiGLU for a down GEMV of type `ty` (float weights read g itself). Returns the xq for the GEMV.
         let sw = |ty: GgmlType, ga: &str, ua: &str, n: usize, rows: usize, q: &str| -> anyhow::Result<u64> {
-            if matches!(ty, GgmlType::F32 | GgmlType::BF16) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
+            if matches!(ty, GgmlType::F32 | GgmlType::BF16) || g.gemv_dequant(ty) { g.swiglu(p(ga), p(ua), rows * n)?; return Ok(0); }
             g.swiglu_q(p(ga), p(ua), n, rows, p(q))
         };
         let (dk, nk, nv) = (c.ssm_d_state, c.ssm_n_group, c.ssm_dt_rank);

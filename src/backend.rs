@@ -116,6 +116,10 @@ pub trait Backend: Send {
     /// L2): `GpuModel::forward` then pipelines one layer per submission, so every combine's answer is already in
     /// memory when its submission begins and no combine ever waits.
     fn expert_pipeline(&self) -> bool { false }
+    /// Whether `gemvq`, `moe_gemv` and their fused kin dequantize `ty` weights in the shader and multiply in f32
+    /// instead of quantizing the activations and taking int8 products (which GCN has to emulate). True also asks
+    /// `swiglu` to leave the expert activations in f32 for the down GEMV.
+    fn gemv_dequant(&self, _ty: GgmlType) -> bool { false }
     /// Zeroed host memory of `words` u32 that kernels read and write at the `Buf` address. The host pointer is
     /// valid while the `Buf` lives.
     fn host_mailbox(&self, words: usize) -> anyhow::Result<(Buf, *mut u32)>;
