@@ -662,6 +662,10 @@ impl<'a> GpuModel<'a> {
         let x = self.x.addr();
         let w = self.worker.as_ref().unwrap();
         let prof = std::env::var_os("STRATA_PIPE_PROF").is_some();
+        // Keep-alive spin appended to each layer's submission (see Backend::spin): the worker round-trip leaves
+        // the GPU idle otherwise and Polaris pays milliseconds of wake-up at every submission start.
+        static SPIN: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let spin = *SPIN.get_or_init(|| std::env::var("STRATA_PIPE_SPIN").ok().and_then(|v| v.parse().ok()).unwrap_or(250_000));
         let (mut t_enq, mut t_sync, mut t_wait) = (0u128, 0u128, 0u128);
         let mut res = 0;
         let mut pending = from;  // MoE layer whose combine is owed: its part ran before the submission that stalled
@@ -674,6 +678,7 @@ impl<'a> GpuModel<'a> {
             }
             res = self.layer(il, l, x, step, Some(w), nt, res, gq, Phase::Pre)?;
             if matches!(l.ffn, Ffn::Moe { .. }) {
+                if spin > 0 { g.spin(spin)?; }  // stay awake over the worker round-trip
                 t_enq += t0.elapsed().as_nanos();
                 let t1 = std::time::Instant::now();
                 // End the submission that raised this layer's request without waiting for it: the worker's

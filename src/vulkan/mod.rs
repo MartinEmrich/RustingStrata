@@ -51,6 +51,7 @@ const SPV: &[(&str, &[u8])] = &[
     ("gemv_f", spv!("gemv_f")),
     ("gemv_q", spv!("gemv_q")),
     ("gtt_probe", spv!("gtt_probe")),
+    ("keep_spin", spv!("keep_spin")),
     ("hc_mix", spv!("hc_mix")),
     ("hc_silu", spv!("hc_silu")),
     ("hc_write", spv!("hc_write")),
@@ -1080,6 +1081,12 @@ impl Backend for Vk {
         let mut st = self.0.st();
         self.0.tsubmit(&mut st)?;
         self.0.submit(&mut st, None, false)
+    }
+    fn spin(&self, iters: u32) -> anyhow::Result<()> {
+        if iters == 0 { return Ok(()); }
+        // The store target is never written (the sum never matches); a null device address keeps the buffer
+        // reference valid to compile. spec[1] is ITERS (spec[0] is common.glsl's LLAMA_Q8, unused here).
+        self.run("keep_spin", &[0, iters], [1, 1, 1], &[&0u64])
     }
 
     /// A reusable command buffer per key, submitted without waiting. `STRATA_NO_GRAPH` runs `f` every time instead.
