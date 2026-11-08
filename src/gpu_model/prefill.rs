@@ -435,12 +435,22 @@ impl GpuModel<'_> {
                     let (pool, stride) = cache.base(lx);
                     let used = |e: &usize| off[e + 1] > off[*e];
                     let missed: Vec<usize> = (0..c.n_expert).filter(used).filter(|&e| cache.slot(il, e) < 0).collect();
+                    // Missed experts with at most `cpu_cap` token slots in the chunk run on the CPU from the mapped
+                    // weights (the decode worker's math, `cpu_moe::expert_rows`): staging costs one GTT->VRAM copy
+                    // per expert whatever its token count, the CPU pass one FFN per token, and on GCN4 the copy rate
+                    // is the floor of prefill (see `Backend::prefill_cpu_moe_cap`). A missed expert's slot rows are
+                    // contiguous, so each CPU expert is one upload into `ye`.
+                    let cpu_cap = std::env::var("STRATA_PF_CPU_MOE").ok().and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or_else(|| g.prefill_cpu_moe_cap());
+                    let (mut cpu, mut stage) = (vec![], vec![]);
+                    for e in missed { if off[e + 1] - off[e] <= cpu_cap { cpu.push(e) } else { stage.push(e) } }
+                    let hs = if cpu.is_empty() { vec![] } else { g.get::<f32>(&pf.slab, l.h, t * ne)? };  // read while the GPU is still idle
                     if prof {
-                        (t_sync, t_sort, staged, layers) = (t_sync + (s1 - s0), t_sort + (s2 - s1), staged + missed.len() * lx.mats.iter().map(|m| m.bytes).sum::<usize>(), layers + 1);
+                        (t_sync, t_sort, staged, layers) = (t_sync + (s1 - s0), t_sort + (s2 - s1), staged + stage.len() * lx.mats.iter().map(|m| m.bytes).sum::<usize>(), layers + 1);
                     }
                     if let Some(pre) = &pre {
                         let mut rs = Vec::new();
-                        for grp in missed.chunks(STAGE) {
+                        for grp in stage.chunks(STAGE) {
                             for (name, mat) in MATS.iter().zip(&lx.mats) {
                                 if mat.fused {  // gate/up halves: not contiguous across experts
                                     for &e in grp { let d = self.m.w.expert(il, name, e, c.n_expert)?.data; rs.push((d.as_ptr() as usize, d.len())); }
@@ -457,7 +467,7 @@ impl GpuModel<'_> {
                     // ids are contiguous there as in the weights and copy in one call.
                     let sp = pf.staging.addr();
                     let half = |j: usize| j % 3 * pf.staging.len() / 3;
-                    let staged: Vec<Vec<(usize, [u64; 3])>> = missed.chunks(STAGE).enumerate()
+                    let staged: Vec<Vec<(usize, [u64; 3])>> = stage.chunks(STAGE).enumerate()
                         .map(|(j, grp)| grp.iter().enumerate().map(|(i, &e)| (e, lx.mats.each_ref().map(|m| sp + (half(j) + STAGE * m.off + i * m.bytes) as u64))).collect())
                         .collect();
                     // The resident experts split into one chunk per staged group, of about equal positions, so the
@@ -549,6 +559,14 @@ impl GpuModel<'_> {
                         })?;
                     }
                     g.beside_join()?;
+                    // The CPU pass runs while the resident GEMMs above are on the GPU; the uploads queue behind them
+                    // and ahead of the combine, which reads every slot row.
+                    for &e in &cpu {
+                        let mut rows = vec![0f32; (off[e + 1] - off[e]) * ne];
+                        let xs: Vec<&[f32]> = (off[e]..off[e + 1]).map(|s| &hs[xrow[s] as usize * ne..][..ne]).collect();
+                        crate::cpu_moe::expert_rows(self.m, il, e, &xs, &mut rows);
+                        g.put(&rows, &pf.slab, l.ye + off[e] * ne)?;
+                    }
                     // The shared down runs last, so the routed gate and up above reuse the int8 h of the shared up.
                     if let Some(s) = shared { g.gemm_dense(&s.down, t, at(l.shg), c.n_ff_shexp, at(l.shy), ne, 0)?; }
                     // Expert rows are slots (token, j) sorted by expert, not tokens.

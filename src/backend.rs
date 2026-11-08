@@ -120,6 +120,11 @@ pub trait Backend: Send {
     /// the ring or poison the results at deep positions (hang hunt in `attn_prefill_dp`), so the Vulkan backend
     /// asks the host to start smaller there; an explicit `--chunk` overrides.
     fn prefill_chunk_cap(&self) -> usize { 0 }
+    /// Missed prefill experts with at most this many token slots run on the CPU from the mapped weights
+    /// (`cpu_moe::expert_rows`), 0: none. Staging costs one GTT->VRAM copy per expert whatever its token count,
+    /// the CPU pass one FFN per token; on GCN4 the copy rate is the floor of prefill, so the tail experts are
+    /// worth taking off the copy engine. `STRATA_PF_CPU_MOE` overrides, 0 there: always stage.
+    fn prefill_cpu_moe_cap(&self) -> usize { 0 }
     /// Whether `gemvq`, `moe_gemv` and their fused kin dequantize `ty` weights in the shader and multiply in f32
     /// instead of quantizing the activations and taking int8 products (which GCN has to emulate). True also asks
     /// `swiglu` to leave the expert activations in f32 for the down GEMV.

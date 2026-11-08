@@ -775,6 +775,51 @@ pub fn experts(m: &Model, il: usize, h: &[f32], sel: &[(usize, f32)]) -> Vec<f32
     y
 }
 
+/// The SwiGLU FFN of routed expert `e` of layer `il` on each row of `xs`, unweighted: out[i] = down_e · (silu(gate_e ·
+/// x_i) * up_e · x_i), rows of n_embd. The weights load once for all rows: the prefill CPU expert pass groups the
+/// (token, expert) pairs of a missed expert, whose slot rows are contiguous. One flat parallel pass per matrix (like
+/// `batch_rows`, 16 outputs per task): the experts of a chunk are many and small, and per-row nested pools would be
+/// all dispatch overhead.
+pub fn expert_rows(m: &Model, il: usize, e: usize, xs: &[&[f32]], out: &mut [f32]) {
+    let c = &m.cfg;
+    let t = |s: &str| m.w.expert(il, s, e, c.n_expert).unwrap_or_else(|er| panic!("{er:#}"));
+    let (gt, ut, dt) = (t("ffn_gate_exps.weight"), t("ffn_up_exps.weight"), t("ffn_down_exps.weight"));
+    let (ff, n, r) = (c.n_ff_exp, c.n_embd, xs.len());
+    assert_eq!(out.len(), r * n, "expert_rows: {r} rows of {n}");
+    let (Some(dg), Some(dd)) = (int_dot(gt.ty), int_dot(dt.ty)) else {
+        return out.par_chunks_mut(n).enumerate().for_each(|(i, o)| {
+            let (mut gg, mut uu) = (vec![0f32; ff], vec![0f32; ff]);
+            matvec(&gt, xs[i], &mut gg);
+            matvec(&ut, xs[i], &mut uu);
+            for (g, u) in gg.iter_mut().zip(uu) { *g = ops::silu(*g) * u; }
+            matvec(&dt, &gg, o);
+        });
+    };
+    // Gate and up of all rows in one pass: output i is row i % ff of the gate ((i / ff) % 2 == 0) or up of input
+    // i / (2 * ff). Gate and up share a type and shape in all supported files, so one row stride serves both.
+    let xq: Vec<Vec<Q8K>> = xs.iter().map(|x| quantize_q8k(x)).collect();
+    let rb = gt.data.len() / gt.rows;
+    let mut a = vec![0f32; 2 * r * ff];
+    a.par_chunks_mut(16).enumerate().for_each(|(ci, ys)| {
+        for (k, v) in ys.iter_mut().enumerate() {
+            let i = ci * 16 + k;
+            let w = if (i / ff) % 2 == 0 { &gt.data } else { &ut.data };
+            *v = dg(&w[(i % ff) * rb..(i % ff + 1) * rb], &xq[i / (2 * ff)]);
+        }
+    });
+    // silu * up per row, quantized for the down pass: output i is row i % n of down for activation i / n.
+    let aq: Vec<Vec<Q8K>> = a.par_chunks(2 * ff).map(|g| {
+        quantize_q8k(&(0..ff).map(|j| ops::silu(g[j]) * g[ff + j]).collect::<Vec<f32>>())
+    }).collect();
+    let rbd = dt.data.len() / dt.rows;
+    out.par_chunks_mut(16).enumerate().for_each(|(ci, ys)| {
+        for (k, v) in ys.iter_mut().enumerate() {
+            let i = ci * 16 + k;
+            *v = dd(&dt.data[(i % n) * rbd..(i % n + 1) * rbd], &aq[i / n]);
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

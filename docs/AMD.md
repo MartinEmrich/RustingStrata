@@ -17,8 +17,10 @@ integer ops; it is otherwise the same binary. GCN has no cooperative matrices (p
 as on RDNA) and no device-coherent memory (the expert mailbox is cached by the GPU until a submission ends, so decode
 runs pipelined; see below). GCN also has no int8 dot-product instruction: GEMMs and GEMVs therefore dequantize the
 weights in the shader and multiply in float (the fast choice; `STRATA_MMQ=<types>` forces the exact-but-slower int8
-path for both). The fp64 RoPE runs at 1/16 rate on GCN — correct, mildly slow. Short prompts pay the expert staging
-cost; long ones amortize it.
+ path for both). The fp64 RoPE runs at 1/16 rate on GCN — correct, mildly slow. Prefill stages its not-resident
+experts one copy per expert from host memory, and that copy rate is the floor of the whole phase, so experts with few
+token slots in a chunk (24 by default) are computed on the CPU from the mapped weights instead;
+`STRATA_PF_CPU_MOE=<max tokens>` moves that boundary (`0`: always stage).
 
 ## First line of the output
 
@@ -71,6 +73,7 @@ Environment variables; set any of them to turn the feature off:
 - `STRATA_VK_RING_MB` / `STRATA_VK_SUBMIT_MB`: upload ring size and bytes per upload submit (64 / 4); raising both
   helps a few percent on cards without a transfer queue.
 - `radv_device_coherent_memory=false`: undo the RADV option strata sets.
+- `STRATA_PF_CPU_MOE=<max tokens>`: the CPU-expert boundary of the intro (`0`: always stage).
 
 For a slow-prefill report, `STRATA_PF_PROF=1` (host-side split per chunk: GPU wait, expert sort, staging) and
 `STRATA_VK_PROF=1` (per-kernel GPU times) print tables at exit; attach both.
