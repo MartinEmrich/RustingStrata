@@ -96,10 +96,6 @@ pub trait Backend: Send {
     /// layer, and the combines' in-kernel waits pace the queue - because a fence wait per layer costs the GPU
     /// wake-up latency of the idle gap it creates (`Backend::expert_pipeline`).
     fn submit_nowait(&self) -> anyhow::Result<()> { self.sync() }
-    /// Keep the GPU busy for a moment (about `iters` cycles on one lane): the pipelined decode forward appends
-    /// this to a layer's submission, so the chip is still awake when the next one (after the worker's answer)
-    /// arrives instead of paying wake-up latency per submission.
-    fn spin(&self, iters: u32) -> anyhow::Result<()> { let _ = iters; Ok(()) }
     /// Run the ops `f` queues as the graph recorded under `key`, recording it on first use. `f` runs only when
     /// recording, so its ops must read per-call values from device memory.
     fn graph(&self, key: u64, f: &mut dyn FnMut() -> anyhow::Result<()>) -> anyhow::Result<()>;
