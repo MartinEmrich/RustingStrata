@@ -614,6 +614,18 @@ impl Vk {
             eprintln!("submit probe: dispatch referencing a {} MB buffer avg {:.0} us (min {:.0})",
                 sz >> 20, s / m * 1e6, lo * 1e6);
         }
+        // The mailbox is host-visible memory the GPU WRITES (the request flag). On a non-coherent device the
+        // driver flushes the GPU's writes at the submission boundary so the host sees them; the read probe
+        // above never writes host memory, so it cannot show that. Time a dispatch writing to host-visible memory.
+        let (mut s, mut lo) = (0f64, f64::MAX);
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            self.add(hbuf.addr(), dbuf.addr(), 1)?;
+            self.sync()?;
+            let dt = t0.elapsed().as_secs_f64();
+            if i >= warm { s += dt; lo = lo.min(dt); }
+        }
+        eprintln!("submit probe: dispatch WRITING host-visible memory avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
         Ok(())
     }
 
