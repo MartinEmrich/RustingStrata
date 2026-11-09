@@ -626,6 +626,21 @@ impl Vk {
             if i >= warm { s += dt; lo = lo.min(dt); }
         }
         eprintln!("submit probe: dispatch WRITING host-visible memory avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
+        // Wake-from-idle: the per-layer worker round-trip idles the GPU between submissions. If an idle GPU takes
+        // milliseconds to start the next submission, that is the per-layer wall. Idle the GPU before submit+sync
+        // and see if the cost grows with idle time (the trivial probes above re-submit instantly, so never idle).
+        for idle_us in [0u64, 200, 1000, 5000] {
+            let (mut s, mut lo) = (0f64, f64::MAX);
+            for i in 0..n {
+                std::thread::sleep(std::time::Duration::from_micros(idle_us));
+                let t0 = std::time::Instant::now();
+                self.run("gtt_probe", &[], [1, 1, 1], &[&dbuf.addr(), &out.addr(), &1u32])?;
+                self.sync()?;
+                let dt = t0.elapsed().as_secs_f64();
+                if i >= warm { s += dt; lo = lo.min(dt); }
+            }
+            eprintln!("submit probe: submit+sync after {idle_us} us GPU idle avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
+        }
         Ok(())
     }
 
