@@ -921,7 +921,7 @@ impl Vk {
             d.cmd_push_constants(cb, self.0.layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             if st.rec.is_none() { if let Some((qp, names, _)) = &mut st.prof { if names.len() < 32767 {
                 if names.is_empty() { d.cmd_reset_query_pool(cb, *qp, 0, 65536); }
-                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, *qp, 2 * names.len() as u32); } } }
+                d.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, *qp, 2 * names.len() as u32); } } }
             d.cmd_dispatch(cb, groups[0] as u32, groups[1] as u32, groups[2] as u32);
         }
         if !st.batch || name == "quant_xq" { self.0.barrier(cb, false); }
