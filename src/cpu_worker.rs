@@ -19,6 +19,12 @@ pub(crate) static PIPE_SUBMIT_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PIPE_REQ_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PIPE_DONE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PIPE_CNT: AtomicU64 = AtomicU64::new(0);
+/// Splits `REQ->DONE` (the worker's turn around a request) into the routing read (which spins re-reading the
+/// non-coherent mailbox until the ids land), the expert compute, and the result write; plus the total re-reads.
+pub(crate) static PIPE_READ_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_WRITE_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_REREAD: AtomicU64 = AtomicU64::new(0);
 static PIPE_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Nanoseconds since a process-wide epoch, comparable across the host and worker threads.
@@ -111,6 +117,7 @@ impl CpuWorker {
                         std::hint::spin_loop();
                     }
                     if r != seq { continue; }
+                    let t_req = if pipe_on() { Some(Instant::now()) } else { None };
                     if pipe_on() {
                         PIPE_REQ_NS.fetch_add(pipe_now().saturating_sub(PIPE_SUBMIT_NS.load(Ordering::Relaxed)), Ordering::Relaxed);
                     }
@@ -128,11 +135,12 @@ impl CpuWorker {
                     // it orders (GCN evicts the flag's cache line first): re-read until the ids are plausible, then
                     // everything the request carries is there. A combine that outwaits this gives up and the host
                     // resumes the forward (GpuModel::finish), so a slow landing costs a resume, not correctness.
-                    for tries in 0.. {
+                    let mut rereads = 0u32;
+                    for tries in 0u32.. {
                         unsafe { read_wc(at(IDS), &mut v) };
                         let ok = (0..kt).all(|j| (v[j] as usize) < m.cfg.n_expert
                             && (0.0..=100.0).contains(&f32::from_bits(v[kt + j])));
-                        if ok { break; }
+                        if ok { rereads = tries; break; }
                         if tries == 2000 {
                             let d: Vec<Vec<u32>> = (0..3).map(|r| v[r * kt..(r + 1) * kt].to_vec()).collect();
                             panic!("mailbox layer {il} seq {seq} nt {nt}: ids out of range after 200 ms of re-reads\n\
@@ -140,6 +148,7 @@ impl CpuWorker {
                         }
                         std::thread::sleep(Duration::from_micros(100));
                     }
+                    let t_read = if pipe_on() { Some(Instant::now()) } else { None };
                     let missed: Vec<usize> = (0..kt).filter(|&j| (v[2 * kt + j] as i32) < 0).map(|j| v[j] as usize).collect();
                     if !missed.is_empty() {
                         // Gate and up first: they are read first.
@@ -158,6 +167,7 @@ impl CpuWorker {
                         let y = crate::cpu_moe::experts(m, il, &h, &sel);
                         unsafe { std::ptr::copy_nonoverlapping(y.as_ptr(), at(lay.y + t * n) as *mut f32, n) };
                     }
+                    let t_comp = if pipe_on() { Some(Instant::now()) } else { None };
                     // SeqCst fences (mfence on x86) also order and flush write-combining stores (Vulkan maps the
                     // mailbox through the BAR): y before DONE, and DONE out now.
                     if let Some(d) = delay { if (seq as usize * 31 + il) % 17 == 0 { std::thread::sleep(d) } }
@@ -165,9 +175,16 @@ impl CpuWorker {
                     unsafe { at(DONE).write_volatile(seq) };
                     fence(Ordering::SeqCst);
                     if pipe_on() {
+                        let t_done = Instant::now();
                         let d = pipe_now().saturating_sub(PIPE_SUBMIT_NS.load(Ordering::Relaxed));
                         PIPE_DONE_NS.fetch_add(d, Ordering::Relaxed);
                         PIPE_CNT.fetch_add(1, Ordering::Relaxed);
+                        if let (Some(a), Some(b), Some(c)) = (t_req, t_read, t_comp) {
+                            PIPE_READ_NS.fetch_add(b.saturating_duration_since(a).as_nanos() as u64, Ordering::Relaxed);
+                            PIPE_COMPUTE_NS.fetch_add(c.saturating_duration_since(b).as_nanos() as u64, Ordering::Relaxed);
+                            PIPE_WRITE_NS.fetch_add(t_done.saturating_duration_since(c).as_nanos() as u64, Ordering::Relaxed);
+                            PIPE_REREAD.fetch_add(rereads as u64, Ordering::Relaxed);
+                        }
                     }
                     bn.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                 }

@@ -721,9 +721,11 @@ impl<'a> GpuModel<'a> {
                     let (sub, fen, cln) = (vk::PIPE_SUB.swap(0, Relaxed), vk::PIPE_FEN.swap(0, Relaxed), vk::PIPE_CLN.swap(0, Relaxed));
                     let cnt = cpu_worker::PIPE_CNT.swap(0, Relaxed).max(1);
                     let (req, done) = (cpu_worker::PIPE_REQ_NS.swap(0, Relaxed) / cnt, cpu_worker::PIPE_DONE_NS.swap(0, Relaxed) / cnt);
-                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms (submit {} fence {} cleanup {}), worker wait {} ms | per layer submit->REQ {:.0} us, REQ->DONE {:.0} us",
+                    let (rd, cp, wr) = (cpu_worker::PIPE_READ_NS.swap(0, Relaxed) / cnt, cpu_worker::PIPE_COMPUTE_NS.swap(0, Relaxed) / cnt, cpu_worker::PIPE_WRITE_NS.swap(0, Relaxed) / cnt);
+                    let rr = cpu_worker::PIPE_REREAD.swap(0, Relaxed) as f64 / cnt as f64;
+                    eprintln!("pipe prof, 64 forwards: enqueue {} ms, sync {} ms (submit {} fence {} cleanup {}), worker wait {} ms | per layer submit->REQ {:.0} us, REQ->DONE {:.0} us | worker read {:.0} us (re-reads {:.1}), compute {:.0} us, write {:.0} us",
                         a as f64 / 1e6, b as f64 / 1e6, sub as f64 / 1e6, fen as f64 / 1e6, cln as f64 / 1e6, d as f64 / 1e6,
-                        req as f64 / 1e3, done as f64 / 1e3);
+                        req as f64 / 1e3, done as f64 / 1e3, rd as f64 / 1e3, rr, cp as f64 / 1e3, wr as f64 / 1e3);
                     pr.set((0, 0, 0, 0));
                 } else { pr.set((a, b, d, n + 1)); }
             });
