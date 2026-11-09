@@ -780,7 +780,8 @@ impl Inner {
                     let mut gaps: Vec<(u64, &str, &str)> = (0..names.len().saturating_sub(1))
                         .map(|i| (t[2 * i + 2].saturating_sub(t[2 * i + 1]), names[i], names[i + 1])).collect();
                     let gap: u64 = gaps.iter().map(|g| g.0).sum();
-                    if gap > 300_000 && PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
+                    let prefill = names.iter().any(|n| *n == "gemm_f_dp" || *n == "attn_prefill_dp");
+                    if !prefill && gap > 50_000 && PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 5 {
                         gaps.sort_by_key(|g| std::cmp::Reverse(g.0));
                         eprintln!("vk gaps: dispatch span {:.1} ms, inter-dispatch gap {:.1} ms over {} dispatches; top transitions:",
                             span as f64 / 1e6, gap as f64 / 1e6, names.len());
