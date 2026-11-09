@@ -503,6 +503,8 @@ impl Vk {
             s(&drv.driver_info), yn(v.0.coop), yn(v.0.coop_i8), yn(v.0.cr.is_some() && !v.0.st().no_cond));
         if std::env::var_os("STRATA_GTT_PROBE").is_some() && let Err(e) = v.gtt_probe() { eprintln!("gtt probe: {e:#}"); }
         if std::env::var_os("STRATA_SUBMIT_PROBE").is_some() && let Err(e) = v.submit_probe() { eprintln!("submit probe: {e:#}"); }
+        #[cfg(feature = "vk-wave64")]
+        if std::env::var_os("STRATA_TRANSPORT_PROBE").is_some() && let Err(e) = v.transport_probe() { eprintln!("transport probe: {e:#}"); }
         Ok(v)
     }
 
@@ -641,6 +643,69 @@ impl Vk {
             }
             eprintln!("submit probe: submit+sync after {idle_us} us GPU idle avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
         }
+        Ok(())
+    }
+
+    /// STRATA_TRANSPORT_PROBE (`vk-wave64` only): the decode mailbox moves the routing out and the CPU expert
+    /// result back through uncached host-visible (BAR) memory that the GPU and CPU spin on. The DMA alternative
+    /// moves the same bytes through device-local buffers and the cached staging buffer (`dtoh`/`htod`). Time one
+    /// layer's round-trip both ways - each is two submits, so only the memory path differs - then price one
+    /// uncached BAR read against one cached host-visible read to attribute the delta. No expert compute.
+    #[cfg(feature = "vk-wave64")]
+    fn transport_probe(&self) -> anyhow::Result<()> {
+        let b = self as &dyn Backend;
+        let (n, warm) = (300usize, 20usize);
+        let m = (n - warm) as f64;
+        let (mbox, mp) = self.buf(16, self.0.mailbox_mem())?;
+        let mp = mp.cast::<u32>();
+        let (_cbuf, cp) = self.buf(4096, HOST)?;
+        let cp = cp.cast::<u32>();
+        let (dbuf, oneb) = (b.zeros::<u8>(4096)?, b.zeros::<u8>(4096)?);
+        let (daddr, one) = (dbuf.addr(), oneb.addr());
+
+        // Mailbox: GPU writes uncached BAR -> host reads it -> host writes it -> GPU reads it.
+        let (mut s, mut lo) = (0f64, f64::MAX);
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            self.add(mbox.addr(), one, 1)?;
+            self.sync()?;
+            let v = unsafe { mp.read_volatile() };
+            unsafe { mp.write_volatile(v) };
+            self.add(daddr, mbox.addr(), 1)?;
+            self.sync()?;
+            let dt = t0.elapsed().as_secs_f64();
+            if i >= warm { s += dt; lo = lo.min(dt); }
+        }
+        eprintln!("transport probe: mailbox (uncached BAR) round-trip avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
+
+        // DMA: GPU writes device-local -> dtoh copies to cached staging (host reads cached) -> htod copies back
+        // to device -> GPU reads device.
+        let (mut s, mut lo) = (0f64, f64::MAX);
+        let mut v = vec![0u8; 64];
+        for i in 0..n {
+            let t0 = std::time::Instant::now();
+            self.add(daddr, one, 1)?;
+            self.dtoh(&dbuf, 0, &mut v)?;
+            self.htod(&v, &dbuf, 0)?;
+            self.add(daddr, one, 1)?;
+            self.sync()?;
+            let dt = t0.elapsed().as_secs_f64();
+            if i >= warm { s += dt; lo = lo.min(dt); }
+        }
+        eprintln!("transport probe: dma (device + cached staging) round-trip avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
+
+        // Attribute the delta: one uncached BAR read vs one cached host-visible read (no GPU, host only).
+        let reps = 2000u32;
+        let (mut a, mut c) = (0u32, 0u32);
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps { a = a.wrapping_add(unsafe { mp.read_volatile() }); }
+        let uncached = t0.elapsed().as_secs_f64();
+        let t1 = std::time::Instant::now();
+        for _ in 0..reps { c = c.wrapping_add(unsafe { cp.read_volatile() }); }
+        let cached = t1.elapsed().as_secs_f64();
+        std::hint::black_box((a, c));
+        eprintln!("transport probe: per-read uncached BAR {:.2} us vs cached host-visible {:.3} us",
+            uncached / reps as f64 * 1e6, cached / reps as f64 * 1e6);
         Ok(())
     }
 
