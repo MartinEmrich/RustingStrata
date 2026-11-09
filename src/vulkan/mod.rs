@@ -775,12 +775,12 @@ impl Inner {
                 let mut t = vec![0u64; 2 * names.len()];
                 unsafe { self.dev.get_query_pool_results(*qp, 0, &mut t, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
                 if std::env::var_os("STRATA_VK_GAPS").is_some() {
-                    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    if !DONE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        let span: u64 = (0..names.len()).map(|i| t[2 * i + 1].saturating_sub(t[2 * i])).sum();
-                        let mut gaps: Vec<(u64, &str, &str)> = (0..names.len().saturating_sub(1))
-                            .map(|i| (t[2 * i + 2].saturating_sub(t[2 * i + 1]), names[i], names[i + 1])).collect();
-                        let gap: u64 = gaps.iter().map(|g| g.0).sum();
+                    static PRINTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                    let span: u64 = (0..names.len()).map(|i| t[2 * i + 1].saturating_sub(t[2 * i])).sum();
+                    let mut gaps: Vec<(u64, &str, &str)> = (0..names.len().saturating_sub(1))
+                        .map(|i| (t[2 * i + 2].saturating_sub(t[2 * i + 1]), names[i], names[i + 1])).collect();
+                    let gap: u64 = gaps.iter().map(|g| g.0).sum();
+                    if gap > 5_000_000 && PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 3 {
                         gaps.sort_by_key(|g| std::cmp::Reverse(g.0));
                         eprintln!("vk gaps: dispatch span {:.1} ms, inter-dispatch gap {:.1} ms over {} dispatches; top transitions:",
                             span as f64 / 1e6, gap as f64 / 1e6, names.len());
