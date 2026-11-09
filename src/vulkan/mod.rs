@@ -598,6 +598,22 @@ impl Vk {
             eprintln!("submit probe: {nd} dispatches+barriers in one submit avg {:.0} us ({:.1} us/dispatch)",
                 s / m * 1e6, s / m / nd as f64 * 1e6);
         }
+        // Does a submission's start cost scale with the SIZE of the buffers it references (the 3.7 GB expert
+        // slots + 1.6 GB weights a layer touches), not their count? A dispatch reading 8 bytes from a small vs
+        // a huge buffer references the whole BO either way; time submit+sync for each.
+        let big = b.zeros::<u8>(1 << 30)?;
+        for (sz, addr) in [(4usize << 10, dbuf.addr()), (1 << 30, big.addr())] {
+            let (mut s, mut lo) = (0f64, f64::MAX);
+            for i in 0..n {
+                let t0 = std::time::Instant::now();
+                self.run("gtt_probe", &[], [1, 1, 1], &[&addr, &out.addr(), &1u32])?;
+                self.sync()?;
+                let dt = t0.elapsed().as_secs_f64();
+                if i >= warm { s += dt; lo = lo.min(dt); }
+            }
+            eprintln!("submit probe: dispatch referencing a {} MB buffer avg {:.0} us (min {:.0})",
+                sz >> 20, s / m * 1e6, lo * 1e6);
+        }
         Ok(())
     }
 
