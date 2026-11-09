@@ -16,6 +16,8 @@ use std::time::Duration;
 thread_local! {
     /// STRATA_PIPE_PROF: (enqueue, sync, worker-wait) nanoseconds and forwards for `forward_pipelined`.
     static PIPE_PROF: std::cell::Cell<(u128, u128, u128, u32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// STRATA_PIPE_SYNC: serialized (submit+sync) nanoseconds and forwards, to price one submission's true GPU cost.
+    static PIPE_SYNC: std::cell::Cell<(u128, u32)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
@@ -681,7 +683,8 @@ impl<'a> GpuModel<'a> {
         let x = self.x.addr();
         let w = self.worker.as_ref().unwrap();
         let prof = std::env::var_os("STRATA_PIPE_PROF").is_some();
-        let (mut t_enq, mut t_sync, mut t_wait) = (0u128, 0u128, 0u128);
+        let syncp = std::env::var_os("STRATA_PIPE_SYNC").is_some();
+        let (mut t_enq, mut t_sync, mut t_wait, mut t_ser) = (0u128, 0u128, 0u128, 0u128);
         let mut res = 0;
         let mut pending = from;  // MoE layer whose combine is owed: its part ran before the submission that stalled
         for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il + 1 - self.first)) {
@@ -700,6 +703,7 @@ impl<'a> GpuModel<'a> {
                 // submission boundary is where the host and GPU make the mailbox coherent (see the probe).
                 if prof { cpu_worker::PIPE_SUBMIT_NS.store(cpu_worker::pipe_now(), std::sync::atomic::Ordering::Relaxed); }
                 g.submit_nowait()?;
+                if syncp { let ts = std::time::Instant::now(); g.sync()?; t_ser += ts.elapsed().as_nanos(); }
                 t_sync += t1.elapsed().as_nanos();
                 let t2 = std::time::Instant::now();
                 w.wait_done(il)?;
@@ -722,6 +726,18 @@ impl<'a> GpuModel<'a> {
                         req as f64 / 1e3, done as f64 / 1e3);
                     pr.set((0, 0, 0, 0));
                 } else { pr.set((a, b, d, n + 1)); }
+            });
+        }
+        if syncp {
+            PIPE_SYNC.with(|pr| {
+                let (a, n) = pr.get();
+                let a = a + t_ser;
+                if n + 1 == 64 {
+                    let layers = (64 * self.layers.iter().filter(|l| matches!(l.ffn, Ffn::Moe { .. })).count()).max(1) as f64;
+                    eprintln!("pipe sync: serialized submit+sync {:.0} us per MoE layer (GPU wall per submission, no overlap)",
+                        a as f64 / 1e3 / layers);
+                    pr.set((0, 0));
+                } else { pr.set((a, n + 1)); }
             });
         }
         if let Some(pl) = pending.take() { self.layer(pl, &self.layers[pl - self.first], x, step, Some(w), nt, 0, gq, Phase::Comb)?; }
