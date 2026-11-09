@@ -583,6 +583,21 @@ impl Vk {
             }
             eprintln!("submit probe: trivial dispatch on {kind} memory avg {:.0} us (min {:.0})", s / m * 1e6, lo * 1e6);
         }
+        // A layer's worth of dispatches in one submission. `run` puts the inter-dispatch pipeline barrier (the
+        // per-dispatch barrier in `record`) after each; a MoE layer has ~15. If 15 dispatches cost far more than
+        // 15x one, that barrier (a GCN TC flush) is the per-layer wall the profiler's spans cannot see.
+        for nd in [1usize, 8, 15, 30] {
+            let (mut s, mut lo) = (0f64, f64::MAX);
+            for i in 0..n {
+                let t0 = std::time::Instant::now();
+                for _ in 0..nd { self.run("gtt_probe", &[], [1, 1, 1], &[&dbuf.addr(), &out.addr(), &1u32])?; }
+                self.sync()?;
+                let dt = t0.elapsed().as_secs_f64();
+                if i >= warm { s += dt; lo = lo.min(dt); }
+            }
+            eprintln!("submit probe: {nd} dispatches+barriers in one submit avg {:.0} us ({:.1} us/dispatch)",
+                s / m * 1e6, s / m / nd as f64 * 1e6);
+        }
         Ok(())
     }
 
