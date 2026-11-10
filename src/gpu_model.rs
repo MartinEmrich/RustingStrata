@@ -21,6 +21,8 @@ thread_local! {
     /// STRATA_STEP_PROF: host wall-clock nanoseconds of the five phases of `step` (embed+put, pass, logits-get, finish,
     /// after-forward) and tokens, to locate where a decode token's wall time goes when the GPU timeline is nearly empty.
     static STEP_PROF: std::cell::Cell<(u128, u128, u128, u128, u128, u32)> = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
+    /// STRATA_WAIT_PROF: (submit->REQ, worker turn, host wake) nanoseconds and forwards, the split of a `wait_done`.
+    static WAIT_PROF: std::cell::Cell<(u64, u64, u64, u32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
 }
 
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
@@ -738,7 +740,9 @@ impl<'a> GpuModel<'a> {
         let w = self.worker.as_ref().unwrap();
         let prof = std::env::var_os("STRATA_PIPE_PROF").is_some();
         let syncp = std::env::var_os("STRATA_PIPE_SYNC").is_some();
+        let wp = std::env::var_os("STRATA_WAIT_PROF").is_some();
         let (mut t_enq, mut t_sync, mut t_wait, mut t_ser) = (0u128, 0u128, 0u128, 0u128);
+        let (mut wa, mut wb, mut wc) = (0u64, 0u64, 0u64);
         let mut res = 0;
         let mut pending = from;  // MoE layer whose combine is owed: its part ran before the submission that stalled
         for (i, l) in self.layers.iter().enumerate().skip(from.map_or(0, |il| il + 1 - self.first)) {
@@ -756,14 +760,30 @@ impl<'a> GpuModel<'a> {
                 // answer below proves the GPU ran it, and the combine's in-kernel wait paces the queue. The
                 // submission boundary is where the host and GPU make the mailbox coherent (see the probe).
                 if prof { cpu_worker::PIPE_SUBMIT_NS.store(cpu_worker::pipe_now(), std::sync::atomic::Ordering::Relaxed); }
+                if wp { w.stamp_submit(il); }
                 g.submit_nowait()?;
                 if syncp { let ts = std::time::Instant::now(); g.sync()?; t_ser += ts.elapsed().as_nanos(); }
                 t_sync += t1.elapsed().as_nanos();
                 let t2 = std::time::Instant::now();
                 w.wait_done(il)?;
                 t_wait += t2.elapsed().as_nanos();
+                if wp { let (a, b, cc) = w.wait_breakdown(il); wa += a; wb += b; wc += cc; }
                 pending = Some(il);
             }
+        }
+        if wp {
+            WAIT_PROF.with(|pr| {
+                let (a, b, c, n) = pr.get();
+                let (a, b, c) = (a + wa, b + wb, c + wc);
+                if n + 1 == 64 {
+                    let layers = (64 * self.layers.iter().filter(|l| matches!(l.ffn, Ffn::Moe { .. })).count()).max(1) as f64;
+                    let cnt = cpu_worker::PIPE_SPIN_CNT.swap(0, std::sync::atomic::Ordering::Relaxed).max(1);
+                    let spins = cpu_worker::PIPE_SPINS.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / cnt as f64;
+                    eprintln!("wait prof, per MoE layer: submit->REQ {:.0} us (worker spun {:.0}x), worker turn {:.0} us, host wake {:.0} us (total {:.0} us)",
+                        a as f64 / layers / 1e3, spins, b as f64 / layers / 1e3, c as f64 / layers / 1e3, (a + b + c) as f64 / layers / 1e3);
+                    pr.set((0, 0, 0, 0));
+                } else { pr.set((a, b, c, n + 1)); }
+            });
         }
         if std::env::var_os("STRATA_STEP_PROF").is_some() {
             eprintln!("  forward_pipelined: enqueue {:.1} ms, submit {:.1} ms, worker-wait {:.1} ms",

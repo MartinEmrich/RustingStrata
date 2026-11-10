@@ -25,6 +25,10 @@ pub(crate) static PIPE_READ_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PIPE_COMPUTE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PIPE_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static PIPE_REREAD: AtomicU64 = AtomicU64::new(0);
+/// STRATA_WAIT_PROF: the worker's REQ-poll spin iterations per layer. High spins over a long submit->REQ means the GPU
+/// was slow to raise the request; low spins over the same wall time means the worker thread was descheduled while waiting.
+pub(crate) static PIPE_SPINS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static PIPE_SPIN_CNT: AtomicU64 = AtomicU64::new(0);
 static PIPE_EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Nanoseconds since a process-wide epoch, comparable across the host and worker threads.
@@ -72,6 +76,9 @@ pub struct CpuWorker {
     tx: Option<mpsc::Sender<u32>>,
     stop: Arc<AtomicBool>,
     busy_ns: Arc<AtomicU64>,
+    /// STRATA_WAIT_PROF: per layer, three host-clock stamps (submit, worker-saw-REQ, worker-wrote-DONE) so the host can
+    /// split a `wait_done` into submit->REQ (GPU running the route), the worker turn, and the host wake.
+    ts: Arc<Vec<AtomicU64>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -87,12 +94,16 @@ impl CpuWorker {
         let (tx, rx) = mpsc::channel::<u32>();
         let (stop, busy_ns) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
         let (st, bn) = (stop.clone(), busy_ns.clone());
+        let nlay = moe_layers.iter().max().map_or(0, |&il| il + 1);
+        let ts = Arc::new((0..3 * nlay).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+        let tsw = ts.clone();
         let mp = m as *const Model as usize;
         let lay = Mailbox::new(c.n_expert_used, c.n_embd);
         let layers = moe_layers.clone();
         // STRATA_TEST_WORKER_DELAY=ms: answer some requests (layer and seq picked by a hash) that much later, as a
         // worker reading experts from a cold drive would (tests the combines that give up).
         let delay = std::env::var("STRATA_TEST_WORKER_DELAY").ok().and_then(|v| v.parse::<u64>().ok()).map(Duration::from_millis);
+        let wp = std::env::var_os("STRATA_WAIT_PROF").is_some();
         // The loop runs on a thread of its own pool, so the expert passes start on it at once and it takes part
         // in them instead of sleeping until a woken pool finishes (~12 us less per layer).
         let pool = rayon::ThreadPoolBuilder::new().num_threads(rayon::current_num_threads())
@@ -111,13 +122,17 @@ impl CpuWorker {
                     // next token, so it did not wait for this one). Waiting for the old seq would hang.
                     let ahead = |v: u32| v != 0 && (v.wrapping_sub(seq) as i32) >= 0;
                     let mut r;
+                    let mut spins = 0u64;
                     while { r = unsafe { at(REQ).read_volatile() }; r != seq } {
                         if st.load(Ordering::Relaxed) { return; }
                         if ahead(r) || ahead(unsafe { at(SKIP).read_volatile() }) { break; }
+                        spins += 1;
                         std::hint::spin_loop();
                     }
                     if r != seq { continue; }
+                    if wp { PIPE_SPINS.fetch_add(spins, Ordering::Relaxed); PIPE_SPIN_CNT.fetch_add(1, Ordering::Relaxed); }
                     let t_req = if pipe_on() { Some(Instant::now()) } else { None };
+                    if wp { tsw[3 * il + 1].store(pipe_now(), Ordering::Relaxed); }
                     if pipe_on() {
                         PIPE_REQ_NS.fetch_add(pipe_now().saturating_sub(PIPE_SUBMIT_NS.load(Ordering::Relaxed)), Ordering::Relaxed);
                     }
@@ -174,6 +189,7 @@ impl CpuWorker {
                     fence(Ordering::SeqCst);
                     unsafe { at(DONE).write_volatile(seq) };
                     fence(Ordering::SeqCst);
+                    if wp { tsw[3 * il + 2].store(pipe_now(), Ordering::Relaxed); }
                     if pipe_on() {
                         let t_done = Instant::now();
                         let d = pipe_now().saturating_sub(PIPE_SUBMIT_NS.load(Ordering::Relaxed));
@@ -190,7 +206,19 @@ impl CpuWorker {
                 }
             }
         }))?;
-        Ok(CpuWorker { _mem: mem, host, dev, layout, seq: 0, layers, tx: Some(tx), stop, busy_ns, thread: Some(thread) })
+        Ok(CpuWorker { _mem: mem, host, dev, layout, seq: 0, layers, tx: Some(tx), stop, busy_ns, ts, thread: Some(thread) })
+    }
+
+    /// STRATA_WAIT_PROF: stamp the host clock when the submission that raises layer `il`'s request is about to go in.
+    pub fn stamp_submit(&self, il: usize) {
+        if 3 * il + 2 < self.ts.len() { self.ts[3 * il].store(pipe_now(), Ordering::Relaxed); }
+    }
+
+    /// STRATA_WAIT_PROF: split the last `wait_done(il)` into (submit->REQ, worker turn REQ->DONE, DONE->host-notices) ns.
+    pub fn wait_breakdown(&self, il: usize) -> (u64, u64, u64) {
+        if 3 * il + 2 >= self.ts.len() { return (0, 0, 0); }
+        let (s, r, d) = (self.ts[3 * il].load(Ordering::Relaxed), self.ts[3 * il + 1].load(Ordering::Relaxed), self.ts[3 * il + 2].load(Ordering::Relaxed));
+        (r.saturating_sub(s), d.saturating_sub(r), pipe_now().saturating_sub(d))
     }
 
     /// Start a new token: returns the sequence number the GPU must publish with.
