@@ -23,6 +23,9 @@ thread_local! {
     static STEP_PROF: std::cell::Cell<(u128, u128, u128, u128, u128, u32)> = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
     /// STRATA_WAIT_PROF: (submit->REQ, worker turn, host wake) nanoseconds and forwards, the split of a `wait_done`.
     static WAIT_PROF: std::cell::Cell<(u64, u64, u64, u32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// STRATA_MTP_PROF: (draft-phase, verify) nanoseconds, drafts tried and accepted, and steps for `spec_step`, to
+    /// price the draft phase against the (amortized) verify and see whether the accepted-token count justifies it.
+    static MTP_PROF: std::cell::Cell<(u128, u128, u64, u64, u32)> = const { std::cell::Cell::new((0, 0, 0, 0, 0)) };
 }
 
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
@@ -913,12 +916,16 @@ impl<'a> GpuModel<'a> {
         let hp = h.pos + nf - 1;
         let mut toks = vec![t];
         let mut hid = self.row_ptr(row + 1 - nf);
+        let prof = std::env::var_os("STRATA_MTP_PROF").is_some();
+        let clk = std::time::Instant::now();
         for i in 0..k {
             let d = if i == 0 { self.mtp_run(&first, hid, true)? } else { self.mtp_run(&toks[i..=i], hid, true)? };
             hid = self.mtp.as_ref().unwrap().x.addr() + 4 * ((if i == 0 { nf } else { 1 } - 1) * self.m.cfg.n_embd) as u64;
             toks.push(d);
         }
+        let draft = if prof { clk.elapsed().as_nanos() } else { 0 };
         let start = self.pos;
+        let clk = std::time::Instant::now();
         let (n, next) = if smp.temp <= 0.0 {
             self.verify_greedy(&toks, |am| (0..k).take_while(|&i| am[i] == toks[i + 1]).count())?
         } else {
@@ -929,8 +936,21 @@ impl<'a> GpuModel<'a> {
                 match smp.accept(&l[n], toks[n + 1] as usize)? { None => n += 1, Some(x) => break (n, x as u32) }
             }
         };
+        let verify = if prof { clk.elapsed().as_nanos() } else { 0 };
         self.drafts.0 += k;
         self.drafts.1 += n;
+        if prof {
+            MTP_PROF.with(|c| {
+                let (d, v, ks, ns, cnt) = c.get();
+                let (d, v, ks, ns) = (d + draft, v + verify, ks + k as u64, ns + n as u64);
+                if cnt + 1 == 8 {
+                    let (df, vf) = (d as f64 / 8e6, v as f64 / 8e6);
+                    eprintln!("mtp prof, 8 steps: draft {df:.1} ms | verify {vf:.1} ms | accepted {ns}/{ks} ({:.0}%) | {:.1} ms/step for {:.2} tok",
+                        100.0 * ns as f64 / ks as f64, df + vf, (ns + ks) as f64 / 8.0);
+                    c.set((0, 0, 0, 0, 0));
+                } else { c.set((d, v, ks, ns, cnt + 1)); }
+            });
+        }
         if n < k { self.rollback(start, n + 1)?; }
         // Draft head entries past t were made from draft hidden states: the next call redoes them from main rows.
         let h = self.mtp.as_mut().unwrap();
