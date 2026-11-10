@@ -18,6 +18,9 @@ thread_local! {
     static PIPE_PROF: std::cell::Cell<(u128, u128, u128, u32)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
     /// STRATA_PIPE_SYNC: serialized (submit+sync) nanoseconds and forwards, to price one submission's true GPU cost.
     static PIPE_SYNC: std::cell::Cell<(u128, u32)> = const { std::cell::Cell::new((0, 0)) };
+    /// STRATA_STEP_PROF: host wall-clock nanoseconds of the five phases of `step` (embed+put, pass, logits-get, finish,
+    /// after-forward) and tokens, to locate where a decode token's wall time goes when the GPU timeline is nearly empty.
+    static STEP_PROF: std::cell::Cell<(u128, u128, u128, u128, u128, u32)> = const { std::cell::Cell::new((0, 0, 0, 0, 0, 0)) };
 }
 
 /// The decode attention `gq_min` for `nt` tokens from position `pos`. The kernels pick the regime per token; when all
@@ -410,9 +413,14 @@ impl<'a> GpuModel<'a> {
     /// Run the forward of `nt` tokens (input in `x`, per-token values in `step_buf`) through this part and the
     /// parts after it. The last part's forward is left running, as `run` leaves it.
     fn pass(&mut self, nt: usize) -> anyhow::Result<()> {
+        let prof = std::env::var_os("STRATA_STEP_PROF").is_some();
         let t0 = std::time::Instant::now();
         self.run(nt)?;
-        if self.next.is_none() { return Ok(()); }
+        let run = t0.elapsed();
+        if self.next.is_none() {
+            if prof { eprintln!("  pass: run {:.1} ms (no split)", run.as_secs_f64() * 1e3); }
+            return Ok(());
+        }
         self.gpu.sync()?;
         let t1 = std::time::Instant::now();
         self.finish(nt, gq_min(self.pos, nt), None)?;
@@ -425,8 +433,10 @@ impl<'a> GpuModel<'a> {
         let seq = nx.worker.as_mut().map_or(0, |w| w.begin());
         let steps: Vec<i32> = (0..nt).flat_map(|t| [(nx.pos + t) as i32, seq as i32]).collect();
         nx.gpu.put(&steps, &nx.step_buf, 0)?;
+        let split = t1.elapsed();
         self.split_time.0 += t1 - t0;
-        self.split_time.1 += t1.elapsed();
+        self.split_time.1 += split;
+        if prof { eprintln!("  pass: run {:.1} ms, split {:.1} ms", run.as_secs_f64() * 1e3, split.as_secs_f64() * 1e3); }
         nx.pass(nt)
     }
 
@@ -445,14 +455,37 @@ impl<'a> GpuModel<'a> {
     /// Run one token; returns logits over the vocabulary.
     pub fn step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
         if self.pos >= self.ctx { bail!("context full ({} tokens; raise --ctx)", self.ctx); }
+        let prof = std::env::var_os("STRATA_STEP_PROF").is_some();
+        let (mut e, mut p, mut l, mut f) = (0u128, 0u128, 0u128, 0u128);
+        let clk = std::time::Instant::now();
         let seq = self.worker.as_mut().map_or(0, |w| w.begin());
         self.put_embed(&[token])?;
         self.gpu.put(&[self.pos as i32, seq as i32], &self.step_buf, 0)?;
+        if prof { e = clk.elapsed().as_nanos(); }
+        let clk = std::time::Instant::now();
         self.pass(1)?;
+        if prof { p = clk.elapsed().as_nanos(); }
+        let clk = std::time::Instant::now();
         let t = self.tail();
         let mut logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?;
+        if prof { l = clk.elapsed().as_nanos(); }
+        let clk = std::time::Instant::now();
         if t.finish(1, gq_min(self.pos, 1), None)? { logits = t.gpu.get::<f32>(&t.logits, 0, self.m.cfg.n_vocab)?; }
+        if prof { f = clk.elapsed().as_nanos(); }
+        let clk = std::time::Instant::now();
         self.after_forward(1)?;
+        if prof {
+            let a = clk.elapsed().as_nanos();
+            STEP_PROF.with(|c| {
+                let (be, bp, bl, bf, ba, n) = c.get();
+                let (be, bp, bl, bf, ba) = (be + e, bp + p, bl + l, bf + f, ba + a);
+                if n + 1 == 8 {
+                    eprintln!("step prof, 8 tokens: embed+put {:.1} | pass {:.1} | logits-get {:.1} | finish {:.1} | after-fwd {:.1} ms",
+                        be as f64 / 1e6, bp as f64 / 1e6, bl as f64 / 1e6, bf as f64 / 1e6, ba as f64 / 1e6);
+                    c.set((0, 0, 0, 0, 0, 0));
+                } else { c.set((be, bp, bl, bf, ba, n + 1)); }
+            });
+        }
         Ok(logits)
     }
 
@@ -476,17 +509,38 @@ impl<'a> GpuModel<'a> {
     /// `verify` for greedy speculation: `keep` gets the argmax of every row; returns its row n and that row's argmax.
     fn verify_greedy(&mut self, tokens: &[u32], keep: impl FnOnce(&[u32]) -> usize) -> anyhow::Result<(usize, u32)> {
         let (nt, nvoc) = (tokens.len(), self.m.cfg.n_vocab);
+        let prof = std::env::var_os("STRATA_STEP_PROF").is_some();
+        let (mut p, mut l, mut f) = (0u128, 0u128, 0u128);
+        let clk = std::time::Instant::now();
         self.verify_run(tokens)?;
+        if prof { p = clk.elapsed().as_nanos(); }
+        let clk = std::time::Instant::now();
         let t = self.tail();
         let g = &t.gpu;
         g.argmax_rows(t.logits.addr(), nvoc, nt, t.amax.addr())?;
         let mut am: Vec<u32> = g.get::<i32>(&t.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
+        if prof { l = clk.elapsed().as_nanos(); }
+        let clk = std::time::Instant::now();
         if t.finish(nt, gq_min(self.pos, nt), None)? {
             g.argmax_rows(t.logits.addr(), nvoc, nt, t.amax.addr())?;
             am = g.get::<i32>(&t.amax, 0, nt)?.into_iter().map(|x| x as u32).collect();
         }
+        if prof { f = clk.elapsed().as_nanos(); }
         let n = keep(&am);
+        let clk = std::time::Instant::now();
         self.after_forward(nt)?;
+        if prof {
+            let a = clk.elapsed().as_nanos();
+            STEP_PROF.with(|c| {
+                let (be, bp, bl, bf, ba, k) = c.get();
+                let (bp, bl, bf, ba) = (bp + p, bl + l, bf + f, ba + a);
+                if k + 1 == 8 {
+                    eprintln!("step prof, 8 tokens: verify_run {:.1} | argmax-get {:.1} | finish {:.1} | after-fwd {:.1} ms",
+                        bp as f64 / 1e6, bl as f64 / 1e6, bf as f64 / 1e6, ba as f64 / 1e6);
+                    c.set((0, 0, 0, 0, 0, 0));
+                } else { c.set((be, bp, bl, bf, ba, k + 1)); }
+            });
+        }
         Ok((n, am[n]))
     }
 
@@ -710,6 +764,10 @@ impl<'a> GpuModel<'a> {
                 t_wait += t2.elapsed().as_nanos();
                 pending = Some(il);
             }
+        }
+        if std::env::var_os("STRATA_STEP_PROF").is_some() {
+            eprintln!("  forward_pipelined: enqueue {:.1} ms, submit {:.1} ms, worker-wait {:.1} ms",
+                t_enq as f64 / 1e6, t_sync as f64 / 1e6, t_wait as f64 / 1e6);
         }
         if prof {
             use std::sync::atomic::Ordering::Relaxed;
