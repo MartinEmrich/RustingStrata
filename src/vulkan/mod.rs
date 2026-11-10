@@ -194,6 +194,13 @@ struct Inner {
     st: Mutex<State>,
 }
 
+/// STRATA_SUBMIT_TIMELINE: brackets each submission's command buffer with a first-command `TOP_OF_PIPE` and a
+/// last-command `BOTTOM_OF_PIPE` timestamp, to split a pipelined decode layer, in pure device clock, into the dispatch
+/// `span` and the `gap` before the next submission's first command runs. A gap much larger than the span means the GPU
+/// idles between submissions (waiting on the host/worker round-trip); a span much larger than the gap means the
+/// kernels fill the layer. Read and reset at each blocking wait (once per forward), so no host clock is needed.
+struct Tl { pool: vk::QueryPool, idx: u32 }
+
 struct State {
     /// Command buffers for ops outside graphs, recycled after each wait.
     pool: vk::CommandPool,
@@ -262,6 +269,8 @@ struct State {
     /// waits before it), names in order, and per-name totals (ns, calls)
     /// printed on drop.
     prof: Option<(vk::QueryPool, Vec<&'static str>, HashMap<&'static str, (u64, usize)>)>,
+    /// STRATA_SUBMIT_TIMELINE: the per-submission GPU-clock bracket (see `Tl`).
+    tl: Option<Tl>,
     /// The `attn_prefill_dp` debug record (gfx8 hang hunt), in mailbox memory so the host can read it while the GPU
     /// is stuck: the arguments the kernel received (0..18), then started and finished flags, see `attn_args_dbg`.
     attn_dbg: (vk::Buffer, vk::DeviceMemory, usize, u64),
@@ -294,6 +303,7 @@ impl Drop for Inner {
             self.dev.destroy_buffer(st.err.0, None);
             self.dev.free_memory(st.err.1, None);
             if let Some((qp, ..)) = &st.prof { self.dev.destroy_query_pool(*qp, None) }
+            if let Some(tl) = &st.tl { self.dev.destroy_query_pool(tl.pool, None) }
             self.dev.destroy_fence(st.fence, None);
             self.dev.destroy_command_pool(st.pool, None);
             self.dev.destroy_command_pool(st.gpool, None);
@@ -457,6 +467,7 @@ impl Vk {
             tspare: vec![], tused: vec![], tbytes: 0, tstart: 0, tring: Default::default(), cstaged: false, cval: 0, tval: 0, bwait: 0, twait: 0, tlag: 0,
             pipes: HashMap::new(), fence, staging: Default::default(), map: 0, staged: 0, ops: 0, copied: (0, 0), bufs: BTreeMap::new(), err: Default::default(),
             prof: if std::env::var_os("STRATA_VK_PROF").is_some() { Some((unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(65536), None) }?, vec![], HashMap::new())) } else { None },
+            tl: if std::env::var_os("STRATA_SUBMIT_TIMELINE").is_some() { Some(Tl { pool: unsafe { dev.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(512), None) }?, idx: 0 }) } else { None },
             attn_dbg: Default::default() };
         let cr = cond.then(|| ash::ext::conditional_rendering::Device::new(&instance, &dev));
         let mut sg = vk::PhysicalDeviceSubgroupSizeControlProperties::default();
@@ -776,6 +787,10 @@ impl Inner {
             &vk::CommandBufferAllocateInfo::default().command_pool(st.pool).command_buffer_count(1)) }?[0] };
         unsafe { self.dev.begin_command_buffer(c, &vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }?;
+        if let Some(tl) = &mut st.tl {
+            if tl.idx == 0 { unsafe { self.dev.cmd_reset_query_pool(c, tl.pool, 0, 512) }; }
+            unsafe { self.dev.cmd_write_timestamp(c, vk::PipelineStageFlags::TOP_OF_PIPE, tl.pool, 2 * tl.idx) };
+        }
         st.cur = Some(c);
         self.cond_on(st, c);
         Ok(c)
@@ -828,6 +843,10 @@ impl Inner {
         if let Some(c) = st.cur.take() {
             st.copied.1 = 0;
             self.end_cond(st, c);
+            if let Some(tl) = &mut st.tl {
+                unsafe { self.dev.cmd_write_timestamp(c, vk::PipelineStageFlags::BOTTOM_OF_PIPE, tl.pool, 2 * tl.idx + 1) };
+                tl.idx += 1;
+            }
             unsafe { self.dev.end_command_buffer(c) }?;
             st.used.push(c);
             cbs.push(c);
@@ -898,6 +917,23 @@ impl Inner {
                 }
                 for (i, n) in names.drain(..).enumerate() { let e = tot.entry(n).or_default(); e.0 += t[2 * i + 1] - t[2 * i]; e.1 += 1; }
             } }
+            if let Some(tl) = st.tl.as_mut().filter(|tl| tl.idx > 0) {
+                let n = (tl.idx as usize).min(256);
+                let mut q = vec![0u64; 2 * n];
+                unsafe { self.dev.get_query_pool_results(tl.pool, 0, &mut q, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT) }?;
+                let mut span: Vec<u64> = (0..n).map(|i| q[2 * i + 1].saturating_sub(q[2 * i])).collect();
+                let mut gap: Vec<u64> = (0..n.saturating_sub(1)).map(|i| q[2 * i + 2].saturating_sub(q[2 * i + 1])).collect();
+                span.sort_unstable(); gap.sort_unstable();
+                let med = |v: &[u64]| v.get(v.len() / 2).copied().unwrap_or(0);
+                static PRINTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+                if PRINTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 40 {
+                    eprintln!("submit timeline: {n} subs | dispatch span us med {:.0} max {:.0} | inter-sub gap us med {:.0} max {:.0} ({})",
+                        med(&span) as f64 / 1e3, *span.last().unwrap_or(&0) as f64 / 1e3, med(&gap) as f64 / 1e3,
+                        *gap.last().unwrap_or(&0) as f64 / 1e3,
+                        if med(&gap) > 2 * med(&span).max(1) { "GPU IDLES between submissions" } else { "GPU busy in dispatches" });
+                }
+                tl.idx = 0;
+            }
             let used = std::mem::take(&mut st.used);
             st.spare.extend(used);
             st.busy = false;
